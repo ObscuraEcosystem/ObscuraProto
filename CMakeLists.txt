@@ -49,32 +49,20 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(websocketpp)
 
-# Find libsodium — portable across Linux, macOS, and Windows
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(LIBSODIUM IMPORTED_TARGET libsodium)
-endif()
+# Declare sodium dependency (via libsodium-cmake wrapper)
+FetchContent_Declare(Sodium
+    GIT_REPOSITORY https://github.com/robinlinden/libsodium-cmake.git
+    GIT_TAG cfebfd3da486d5a86c644c8b47067e5411c7599c
+)
+set(SODIUM_DISABLE_TESTS ON)
+FetchContent_MakeAvailable(Sodium)
 
-if(LIBSODIUM_FOUND)
-    message(STATUS "Found libsodium via pkg-config: ${LIBSODIUM_LIBRARIES}")
-    set(LIBSODIUM_LIBRARY PkgConfig::LIBSODIUM)
-else()
-    find_path(LIBSODIUM_INCLUDE_DIR
-        NAMES sodium.h
-        HINTS ENV LIBSODIUM_ROOT
-    )
-    find_library(LIBSODIUM_LIBRARY
-        NAMES sodium libsodium
-        HINTS ENV LIBSODIUM_ROOT
-    )
-
-    if(NOT LIBSODIUM_INCLUDE_DIR OR NOT LIBSODIUM_LIBRARY)
-        message(FATAL_ERROR "libsodium not found. Install it via your package manager "
-                            "(e.g., 'brew install libsodium' or 'apt install libsodium-dev').")
-    endif()
-
-    message(STATUS "Found libsodium: ${LIBSODIUM_LIBRARY}")
-endif()
+# Fix sodium target's include directories for proper export support.
+# libsodium-cmake uses unprefixed relative paths which CMake rejects when exporting.
+set_target_properties(sodium PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES
+        "$<BUILD_INTERFACE:${sodium_SOURCE_DIR}/libsodium/src/libsodium/include>;$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
+)
 
 
 
@@ -109,12 +97,6 @@ target_include_directories(obscuraproto
         $<BUILD_INTERFACE:${websocketpp_SOURCE_DIR}>
 )
 
-if(LIBSODIUM_INCLUDE_DIR)
-    target_include_directories(obscuraproto
-        PUBLIC
-            $<BUILD_INTERFACE:${LIBSODIUM_INCLUDE_DIR}>
-    )
-endif()
 
 # Add compile definitions
 target_compile_definitions(obscuraproto
@@ -129,19 +111,11 @@ if(WIN32)
     target_link_libraries(obscuraproto PUBLIC ws2_32)
 endif()
 
-if(TARGET PkgConfig::LIBSODIUM)
-    target_link_libraries(obscuraproto
-        PUBLIC
-            Threads::Threads
-            PkgConfig::LIBSODIUM
-    )
-else()
-    target_link_libraries(obscuraproto
-        PUBLIC
-            Threads::Threads
-            ${LIBSODIUM_LIBRARY}
-    )
-endif()
+target_link_libraries(obscuraproto
+    PUBLIC
+        Threads::Threads
+        sodium
+)
 
 
 # ##############################################################################
@@ -185,8 +159,8 @@ write_basic_package_version_file(
     COMPATIBILITY AnyNewerVersion
 )
 
-# Create an export set for the library target
-install(TARGETS obscuraproto
+# Create an export set for the library target and its dependencies
+install(TARGETS obscuraproto sodium
     EXPORT ObscuraProtoTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

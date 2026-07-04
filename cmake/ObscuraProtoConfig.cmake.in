@@ -5,14 +5,21 @@ include(CMakeFindDependencyMacro)
 # Find all dependencies for the project
 find_dependency(Threads REQUIRED)
 
-# Asio, websocketpp, and sodium were brought in via FetchContent.
+# Asio and websocketpp were brought in via FetchContent.
 # When this project is consumed as a package, its dependencies need to be found on the system.
 # You might need to adjust these find_dependency calls if the packages
 # are not easily findable by default on the consumer's system.
-# For this example, we assume they can be found.
 find_dependency(asio REQUIRED)
 find_dependency(websocketpp REQUIRED)
-find_dependency(sodium REQUIRED)
+
+# Sodium is fetched via FetchContent for both build and consumption
+include(FetchContent)
+FetchContent_Declare(Sodium
+    GIT_REPOSITORY https://github.com/robinlinden/libsodium-cmake.git
+    GIT_TAG cfebfd3da486d5a86c644c8b47067e5411c7599c
+)
+set(SODIUM_DISABLE_TESTS ON)
+FetchContent_MakeAvailable(Sodium)
 
 
 # Include the targets file

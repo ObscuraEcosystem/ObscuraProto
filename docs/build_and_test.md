@@ -8,7 +8,7 @@ Ensure you have the following installed on your system:
 *   `cmake` (version 3.11 or newer)
 *   A C++ compiler (e.g., g++ for Linux, Clang, MSVC)
 *   `build-essential` (for Debian/Ubuntu-based systems)
-*   `libsodium-dev` (for Debian/Ubuntu-based systems, or equivalent for your OS)
+*   Internet connection (for CMake's `FetchContent` to download dependencies automatically)
 
 ## Building the Project
 

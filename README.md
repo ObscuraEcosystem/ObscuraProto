@@ -573,7 +573,7 @@ Each stream is **bidirectional**: both sides can write and read data using the s
 
 ### Dependencies
 
-This library requires **libsodium**, **websocketpp**, and **asio**. If you are using CMake, they will be fetched and configured automatically via `FetchContent`. You only need to link against the `obscuraproto` target.
+All dependencies (**libsodium**, **websocketpp**, **asio**) are fetched and configured automatically via CMake's `FetchContent`. You only need to link against the `obscuraproto` target.
 
 ```cmake
 target_link_libraries(your_executable_name

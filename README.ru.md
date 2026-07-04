@@ -570,7 +570,7 @@ outgoing_stream->end();
 
 ### Зависимости
 
-Эта библиотека требует **libsodium**, **websocketpp** и **asio**. Если вы используете CMake, они будут автоматически загружены и настроены с помощью `FetchContent`. Вам нужно только слинковать вашу цель с `obscuraproto`.
+Все зависимости (**libsodium**, **websocketpp**, **asio**) автоматически загружаются и настраиваются через CMake `FetchContent`. Вам нужно только слинковать вашу цель с `obscuraproto`.
 
 ```cmake
 target_link_libraries(your_executable_name
