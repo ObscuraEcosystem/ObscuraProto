@@ -204,8 +204,8 @@ namespace ObscuraProto {
             uint32_t stream_id = next_outgoing_stream_id_ * 2 + 1;
             next_outgoing_stream_id_++;
 
-            auto stream = std::make_shared<Stream>(
-                stream_id, [this, hdl](const Payload& p) { send(hdl, p); }, stream_op_code);
+            auto stream =
+                std::make_shared<Stream>(stream_id, [this, hdl](const Payload& p) { send(hdl, p); }, stream_op_code);
 
             {
                 std::lock_guard<std::mutex> lock(streams_mutex_);
