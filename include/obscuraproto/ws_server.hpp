@@ -27,6 +27,10 @@ namespace ObscuraProto {
             using OnRequestCallback = std::function<Payload(WsConnectionHdl, PayloadReader&)>;
             using IdentityHandler = std::function<bool(WsConnectionHdl, PublicKey)>;
 
+            // Callbacks for connection lifecycle events
+            using OnOpenCallback = std::function<void(WsConnectionHdl)>;
+            using OnCloseCallback = std::function<void(WsConnectionHdl)>;
+
             WsServerWrapper(KeyPair server_sign_key, Config config = Config::with_defaults());
             ~WsServerWrapper();
 
@@ -78,6 +82,18 @@ namespace ObscuraProto {
              * @param callback The function to call.
              */
             void set_default_payload_handler(OnPayloadCallback callback);
+
+            /**
+             * @brief Registers a callback called when a new WebSocket connection is opened.
+             * @param callback The function to call with the connection handle.
+             */
+            void set_on_open_callback(OnOpenCallback callback);
+
+            /**
+             * @brief Registers a callback called when a WebSocket connection is closed.
+             * @param callback The function to call with the connection handle.
+             */
+            void set_on_close_callback(OnCloseCallback callback);
 
             /**
              * @brief DEPRECATED: Sets the default payload handler. Use set_default_payload_handler for clarity.
@@ -238,6 +254,10 @@ namespace ObscuraProto {
             std::mutex identity_map_mutex_;
             std::map<PublicKey, WsConnectionHdl> identity_to_hdl_;
             std::map<WsConnectionHdl, PublicKey, std::owner_less<WsConnectionHdl>> hdl_to_identity_;
+
+            // Callbacks for connection lifecycle
+            OnOpenCallback on_open_callback_;
+            OnCloseCallback on_close_callback_;
 
             // Periodic timeout check timer
             std::shared_ptr<asio::steady_timer> timeout_timer_;

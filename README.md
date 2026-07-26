@@ -313,6 +313,32 @@ For more advanced scenarios where you might not want to respond immediately, you
 
 A complete example demonstrating this bidirectional pattern can be found in `examples/request_response_example.cpp`.
 
+### 6.2. Connection Lifecycle Callbacks
+
+The high-level API provides callbacks to track the lifecycle of WebSocket connections — when a client connects and when it disconnects. This is useful for logging, connection tracking, and resource management.
+
+Both callbacks receive a `WsConnectionHdl` (connection handle) and are optional — the server functions correctly without them.
+
+#### `set_on_open_callback`
+
+Fires immediately after the WebSocket handshake (TCP connection established), before the ObscuraProto cryptographic handshake begins.
+
+```cpp
+server.set_on_open_callback([](WsConnectionHdl hdl) {
+    std::cout << "[SERVER] New WebSocket connection" << std::endl;
+});
+```
+
+#### `set_on_close_callback`
+
+Fires when a WebSocket connection closes, while the handle is still valid. Internal cleanup (session removal, stream cancellation, pending request fulfillment) happens after this callback returns.
+
+```cpp
+server.set_on_close_callback([](WsConnectionHdl hdl) {
+    std::cout << "[SERVER] Connection closed" << std::endl;
+});
+```
+
 ### Step 1: Initialization and Key Setup
 
 This step is the same as in the low-level API. You need to initialize the crypto library and set up the server's keys.

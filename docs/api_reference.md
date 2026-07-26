@@ -273,6 +273,16 @@ Registers a simplified handler for a request-response interaction. This is the r
 Sets a callback function to be invoked when a `Payload` is received from any client and there is no specific handler registered for its `op_code`. This acts as a catch-all handler.
 - **Callback signature:** `std::function<void(WsConnectionHdl, Payload)>`
 
+#### `void set_on_open_callback(OnOpenCallback callback)`
+Registers a callback invoked when a new WebSocket connection is established. The callback fires immediately after the TCP/WebSocket handshake, before the ObscuraProto cryptographic handshake.
+- `callback`: A function that receives the connection handle of the newly connected client.
+- **Callback signature:** `std::function<void(WsConnectionHdl)>`
+
+#### `void set_on_close_callback(OnCloseCallback callback)`
+Registers a callback invoked when a WebSocket connection is closed. The callback fires while the connection handle is still valid, before internal cleanup of sessions, streams, and pending requests.
+- `callback`: A function that receives the connection handle of the disconnected client.
+- **Callback signature:** `std::function<void(WsConnectionHdl)>`
+
 #### `void set_on_payload_callback(OnPayloadCallback callback)`
 **Deprecated.** This method now calls `set_default_payload_handler`. Use `set_default_payload_handler` for clarity or `register_op_handler` for specific op-codes.
 

@@ -13,6 +13,7 @@ namespace ObscuraProto {
               rate_limiter_(config_.rate_limit),
               server_sign_key_(std::move(server_sign_key)) {
             server_.init_asio();
+            server_.set_reuse_addr(true);
             server_.set_open_handler(std::bind(&WsServerWrapper::on_open, this, std::placeholders::_1));
             server_.set_close_handler(std::bind(&WsServerWrapper::on_close, this, std::placeholders::_1));
             server_.set_message_handler(
@@ -218,6 +219,14 @@ namespace ObscuraProto {
             default_payload_handler_ = std::move(callback);
         }
 
+        void WsServerWrapper::set_on_open_callback(OnOpenCallback callback) {
+            on_open_callback_ = std::move(callback);
+        }
+
+        void WsServerWrapper::set_on_close_callback(OnCloseCallback callback) {
+            on_close_callback_ = std::move(callback);
+        }
+
         // legacy
         void WsServerWrapper::set_on_payload_callback(OnPayloadCallback callback) {
             set_default_payload_handler(std::move(callback));
@@ -252,9 +261,19 @@ namespace ObscuraProto {
 
             // Note: we wait for the ClientHello to create a session.
             // Remote IP is recorded per-connection in on_close cleanup.
+
+            // Notify the callback after the connection is set up
+            if (on_open_callback_) {
+                on_open_callback_(hdl);
+            }
         }
 
         void WsServerWrapper::on_close(WsConnectionHdl hdl) {
+            // Notify the callback before cleanup (hdl is still valid)
+            if (on_close_callback_) {
+                on_close_callback_(hdl);
+            }
+
             auto auth_it = sessions_.find(hdl);
             if (auth_it != sessions_.end()) {
                 rate_limiter_.unregister_connection(auth_it->second.rate_limiter_id, auth_it->second.remote_ip);

@@ -273,6 +273,16 @@
 Устанавливает функцию обратного вызова, которая будет вызвана при получении `Payload` от любого клиента, если для его `op_code` не зарегистрирован специальный обработчик. Работает как "catch-all" обработчик.
 - **Сигнатура:** `std::function<void(WsConnectionHdl, Payload)>`
 
+#### `void set_on_open_callback(OnOpenCallback callback)`
+Регистрирует колбэк, вызываемый при установлении нового WebSocket-соединения. Колбэк срабатывает сразу после TCP/WebSocket рукопожатия, до криптографического рукопожатия ObscuraProto.
+- `callback`: Функция, принимающая дескриптор соединения нового клиента.
+- **Сигнатура:** `std::function<void(WsConnectionHdl)>`
+
+#### `void set_on_close_callback(OnCloseCallback callback)`
+Регистрирует колбэк, вызываемый при закрытии WebSocket-соединения. Колбэк срабатывает, пока дескриптор соединения ещё валиден, до очистки сессий, потоков и ожидающих запросов.
+- `callback`: Функция, принимающая дескриптор соединения отключившегося клиента.
+- **Сигнатура:** `std::function<void(WsConnectionHdl)>`
+
 #### `void set_on_payload_callback(OnPayloadCallback callback)`
 **Устарело.** Этот метод теперь вызывает `set_default_payload_handler`. Используйте `set_default_payload_handler` для ясности или `register_op_handler` для конкретных кодов операций.
 
