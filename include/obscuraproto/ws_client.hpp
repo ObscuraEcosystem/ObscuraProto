@@ -93,10 +93,25 @@ namespace ObscuraProto {
             std::shared_ptr<Stream> start_stream();
 
             /**
+             * @brief Starts a new outgoing stream with a specific op_code.
+             * @param stream_op_code The op_code for the stream.
+             * @return A shared pointer to the new Stream object.
+             */
+            std::shared_ptr<Stream> start_stream(Payload::OpCode stream_op_code);
+
+            /**
              * @brief Registers a handler for incoming streams initiated by the server.
              * @param callback The function to call when a new stream is received.
              */
             void register_incoming_stream_handler(std::function<void(std::shared_ptr<Stream>)> callback);
+
+            /**
+             * @brief Registers a handler for incoming streams with a specific op_code.
+             * @param op_code The op_code of streams to handle.
+             * @param callback The function to call when a matching stream is received.
+             */
+            void register_stream_handler(Payload::OpCode op_code,
+                                         std::function<void(std::shared_ptr<Stream>)> callback);
 
         private:
             void on_open(WsConnectionHdl hdl);
@@ -132,6 +147,10 @@ namespace ObscuraProto {
             std::map<uint32_t, std::shared_ptr<Stream>> active_streams_;
             std::function<void(std::shared_ptr<Stream>)> incoming_stream_handler_;
             uint32_t next_outgoing_stream_id_ = 0;
+
+            // For op_code-routed streams
+            std::mutex stream_handlers_mutex_;
+            std::map<Payload::OpCode, std::function<void(std::shared_ptr<Stream>)>> stream_handlers_;
         };
 
     }  // namespace net

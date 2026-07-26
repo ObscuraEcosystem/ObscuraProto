@@ -14,17 +14,55 @@ TEST(VersionNegotiationTest, SuccessfulNegotiation) {
     EXPECT_EQ(*result, Versions::V1_0);
 }
 
-// TEST(VersionNegotiationTest, FallbackNegotiation) {
-//     // This test is not relevant when only one version exists.
-//     // Re-enable when more versions are added.
-//     const std::vector<Version> client_versions = {0x0101, Versions::V1_0};
-//     const std::vector<Version> server_versions = {Versions::V1_0};
+TEST(VersionNegotiationTest, PreferV1_1OverV1_0) {
+    const std::vector<Version> client_versions = {Versions::V1_1, Versions::V1_0};
+    const std::vector<Version> server_versions = {Versions::V1_1, Versions::V1_0};
 
-//     auto result = VersionNegotiator::negotiate(client_versions, server_versions);
+    auto result = VersionNegotiator::negotiate(client_versions, server_versions);
 
-//     ASSERT_TRUE(result.has_value());
-//     EXPECT_EQ(*result, Versions::V1_0);
-// }
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, Versions::V1_1);
+}
+
+TEST(VersionNegotiationTest, FallbackToV1_0) {
+    const std::vector<Version> client_versions = {Versions::V1_1, Versions::V1_0};
+    const std::vector<Version> server_versions = {Versions::V1_0};
+
+    auto result = VersionNegotiator::negotiate(client_versions, server_versions);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, Versions::V1_0);
+}
+
+TEST(VersionNegotiationTest, ClientHasOlderVersion) {
+    const std::vector<Version> client_versions = {Versions::V1_0};
+    const std::vector<Version> server_versions = {Versions::V1_1, Versions::V1_0};
+
+    auto result = VersionNegotiator::negotiate(client_versions, server_versions);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, Versions::V1_0);
+}
+
+TEST(VersionNegotiationTest, ServerOnlyV1_1) {
+    const std::vector<Version> client_versions = {Versions::V1_1, Versions::V1_0};
+    const std::vector<Version> server_versions = {Versions::V1_1};
+
+    auto result = VersionNegotiator::negotiate(client_versions, server_versions);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, Versions::V1_1);
+}
+
+TEST(VersionNegotiationTest, ClientOrderRespected) {
+    const std::vector<Version> client_versions = {Versions::V1_0, Versions::V1_1};
+    const std::vector<Version> server_versions = {Versions::V1_1, Versions::V1_0};
+
+    auto result = VersionNegotiator::negotiate(client_versions, server_versions);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, Versions::V1_0);
+}
 
 TEST(VersionNegotiationTest, NoCommonVersion) {
     constexpr Version V_UNKNOWN = 0xFFFF;
@@ -36,17 +74,14 @@ TEST(VersionNegotiationTest, NoCommonVersion) {
     EXPECT_FALSE(result.has_value());
 }
 
-// TEST(VersionNegotiationTest, ClientHasOlderVersion) {
-//     // This test is not relevant when only one version exists.
-//     // It's effectively the same as SuccessfulNegotiation.
-//     const std::vector<Version> client_versions = {Versions::V1_0};
-//     const std::vector<Version> server_versions = {0x0101, Versions::V1_0};
+TEST(VersionNegotiationTest, MultipleVersionsNoMatch) {
+    const std::vector<Version> client_versions = {0x0200, 0x0300};
+    const std::vector<Version> server_versions = {Versions::V1_1, Versions::V1_0};
 
-//     auto result = VersionNegotiator::negotiate(client_versions, server_versions);
+    auto result = VersionNegotiator::negotiate(client_versions, server_versions);
 
-//     ASSERT_TRUE(result.has_value());
-//     EXPECT_EQ(*result, Versions::V1_0);
-// }
+    EXPECT_FALSE(result.has_value());
+}
 
 TEST(VersionNegotiationTest, EmptyClientList) {
     const std::vector<Version> client_versions = {};

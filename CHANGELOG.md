@@ -1,3 +1,15 @@
-## 1.0.2
-- Added `set_on_open_callback` / `set_on_close_callback` to `WsServerWrapper` — connection lifecycle callbacks that fire on WebSocket open and close events.
-- Added server-side `SO_REUSEADDR` (`set_reuse_addr(true)`) to prevent "Address already in use" errors on rapid restart.
+## 1.1.0
+- Added protocol version V1_1 (`0x0101`) with opCode-routed streams.
+  - `Stream` now carries an optional `op_code_` field, accessible via `get_op_code()`.
+  - `start_stream(Payload::OpCode)` overload on both client and server — opens a stream tagged with an application-level opCode.
+  - `register_stream_handler(Payload::OpCode, callback)` — registers a dedicated handler for incoming streams with a specific opCode.
+  - `register_anon_stream_handler(Payload::OpCode, callback)` — same for anonymous sessions.
+  - If no specific handler matches, the stream falls through to `incoming_stream_handler_` (backward compatible).
+  - On V1_0 negotiation (e.g. old peer), `start_stream(opCode)` transparently falls back to legacy format — no opCode in `STREAM_START`.
+- Configurable protocol versions: added `supported_versions` field to `Config`.
+  - Developer can now specify which protocol versions to support (e.g. `{V1_0}`, `{V1_1}`, or the default `{V1_1, V1_0}`).
+  - `Session` constructor accepts a custom version list; `WsClientWrapper`/`WsServerWrapper` propagate it from `Config`.
+  - Parsed from YAML config (`supported_versions: [0x0101, 0x0100]`) via `Config::from_yaml()`.
+  - When no common version exists between client and server, the handshake fails cleanly with a `RuntimeError`.
+- Fixed thread safety: stream handler callbacks are now copied out of `stream_handlers_mutex_` before invocation, preventing potential deadlock if the handler calls `register_stream_handler()`.
+- `SUPPORTED_VERSIONS` now includes V1_1 as the preferred version (`{V1_1, V1_0}`).

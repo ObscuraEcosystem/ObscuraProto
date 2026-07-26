@@ -108,10 +108,34 @@ namespace ObscuraProto {
             std::shared_ptr<Stream> start_stream(WsConnectionHdl hdl);
 
             /**
+             * @brief Starts a new outgoing stream to a specific client with a specific op_code.
+             * @param hdl The connection handle of the client.
+             * @param stream_op_code The op_code for the stream.
+             * @return A shared pointer to the new Stream object.
+             */
+            std::shared_ptr<Stream> start_stream(WsConnectionHdl hdl, Payload::OpCode stream_op_code);
+
+            /**
              * @brief Registers a handler for incoming streams initiated by a client.
              * @param callback The function to call when a new stream is received.
              */
             void register_incoming_stream_handler(std::function<void(std::shared_ptr<Stream>)> callback);
+
+            /**
+             * @brief Registers a handler for incoming authenticated streams with a specific op_code.
+             * @param op_code The op_code of streams to handle.
+             * @param callback The function to call when a matching stream is received.
+             */
+            void register_stream_handler(Payload::OpCode op_code,
+                                         std::function<void(std::shared_ptr<Stream>)> callback);
+
+            /**
+             * @brief Registers a handler for incoming anonymous streams with a specific op_code.
+             * @param op_code The op_code of streams to handle.
+             * @param callback The function to call when a matching stream is received.
+             */
+            void register_anon_stream_handler(Payload::OpCode op_code,
+                                              std::function<void(std::shared_ptr<Stream>)> callback);
 
             // --- Anonymous Sessions ---
 
@@ -248,6 +272,14 @@ namespace ObscuraProto {
                 per_connection_streams_;
             std::function<void(std::shared_ptr<Stream>)> incoming_stream_handler_;
             uint32_t next_outgoing_stream_id_ = 0;
+
+            // For op_code-routed streams (authenticated)
+            std::mutex stream_handlers_mutex_;
+            std::map<Payload::OpCode, std::function<void(std::shared_ptr<Stream>)>> stream_handlers_;
+
+            // For op_code-routed streams (anonymous)
+            std::mutex anon_stream_handlers_mutex_;
+            std::map<Payload::OpCode, std::function<void(std::shared_ptr<Stream>)>> anon_stream_handlers_;
 
             // Client identity
             IdentityHandler client_identity_handler_;

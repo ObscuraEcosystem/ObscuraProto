@@ -3,6 +3,9 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
+
+#include "version.hpp"
 
 namespace ObscuraProto {
 
@@ -67,10 +70,13 @@ namespace ObscuraProto {
         MessageLimitConfig message_limits;
         TimeoutConfig timeouts;
         ReservedOpcodes opcodes;
+        std::vector<Version> supported_versions;
 
         static Config from_yaml(const std::string& path);
         static Config with_defaults() {
-            return Config{};
+            Config cfg{};
+            cfg.supported_versions = {Versions::V1_1, Versions::V1_0};
+            return cfg;
         }
     };
 

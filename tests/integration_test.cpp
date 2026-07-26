@@ -399,3 +399,393 @@ TEST_F(WsIntegrationTest, IdentityRejection) {
     client.disconnect();
     server.stop();
 }
+
+// ========== OpCode Stream Routing Tests ==========
+
+TEST_F(WsIntegrationTest, OpCodeSpecificStreamRouting) {
+    auto client_identity = ObscuraProto::Crypto::generate_sign_keypair();
+
+    ObscuraProto::net::WsServerWrapper server(server_sign_key);
+    std::promise<void> server_got_stream;
+    std::promise<void> server_got_data;
+    std::promise<void> client_got_data;
+    server.set_client_identity_handler(
+        [&](auto hdl, ObscuraProto::PublicKey pk) -> bool { return pk.data == client_identity.publicKey.data; });
+    server.register_stream_handler(OP_ECHO, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        EXPECT_TRUE(stream->get_op_code().has_value());
+        EXPECT_EQ(stream->get_op_code().value(), OP_ECHO);
+        server_got_stream.set_value();
+        stream->set_data_handler([stream, &server_got_data](const ObscuraProto::byte_vector& data) {
+            std::string msg(data.begin(), data.end());
+            EXPECT_EQ(msg, "hello from client");
+            server_got_data.set_value();
+            stream->write(ObscuraProto::byte_vector{'w', 'o', 'r', 'l', 'd'});
+        });
+    });
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
+    client.set_client_identity(client_identity);
+    std::promise<void> client_ready;
+    client.set_on_ready_callback([&]() { client_ready.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    auto client_stream = client.start_stream(OP_ECHO);
+    ASSERT_EQ(server_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client_stream->set_data_handler([&](const ObscuraProto::byte_vector& data) {
+        std::string msg(data.begin(), data.end());
+        EXPECT_EQ(msg, "world");
+        client_got_data.set_value();
+    });
+    client_stream->write(
+        ObscuraProto::byte_vector{'h', 'e', 'l', 'l', 'o', ' ', 'f', 'r', 'o', 'm', ' ', 'c', 'l', 'i', 'e', 'n', 't'});
+    ASSERT_EQ(server_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    ASSERT_EQ(client_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.disconnect();
+    server.stop();
+}
+
+TEST_F(WsIntegrationTest, FallbackToGenericStreamHandler) {
+    auto client_identity = ObscuraProto::Crypto::generate_sign_keypair();
+    constexpr uint16_t OP_NO_HANDLER = 0x9001;
+
+    ObscuraProto::net::WsServerWrapper server(server_sign_key);
+    std::promise<void> server_got_stream;
+    std::promise<void> server_got_data;
+    server.set_client_identity_handler(
+        [&](auto hdl, ObscuraProto::PublicKey pk) -> bool { return pk.data == client_identity.publicKey.data; });
+    server.register_incoming_stream_handler([&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        EXPECT_TRUE(stream->get_op_code().has_value());
+        EXPECT_EQ(stream->get_op_code().value(), OP_NO_HANDLER);
+        server_got_stream.set_value();
+        stream->set_data_handler([&](const ObscuraProto::byte_vector& data) {
+            std::string msg(data.begin(), data.end());
+            EXPECT_EQ(msg, "fallback data");
+            server_got_data.set_value();
+        });
+    });
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
+    client.set_client_identity(client_identity);
+    std::promise<void> client_ready;
+    client.set_on_ready_callback([&]() { client_ready.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    auto client_stream = client.start_stream(OP_NO_HANDLER);
+    ASSERT_EQ(server_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client_stream->write(ObscuraProto::byte_vector{'f', 'a', 'l', 'l', 'b', 'a', 'c', 'k', ' ', 'd', 'a', 't', 'a'});
+    ASSERT_EQ(server_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.disconnect();
+    server.stop();
+}
+
+TEST_F(WsIntegrationTest, BackwardCompatibleStartStream) {
+    auto client_identity = ObscuraProto::Crypto::generate_sign_keypair();
+
+    ObscuraProto::net::WsServerWrapper server(server_sign_key);
+    std::promise<void> server_got_data;
+    std::promise<void> client_got_data;
+    server.set_client_identity_handler(
+        [&](auto hdl, ObscuraProto::PublicKey pk) -> bool { return pk.data == client_identity.publicKey.data; });
+    server.register_incoming_stream_handler([&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        EXPECT_FALSE(stream->get_op_code().has_value());
+        stream->set_data_handler([stream, &server_got_data](const ObscuraProto::byte_vector& data) {
+            std::string msg(data.begin(), data.end());
+            EXPECT_EQ(msg, "hello");
+            server_got_data.set_value();
+            stream->write(ObscuraProto::byte_vector{'e', 'c', 'h', 'o'});
+        });
+    });
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
+    client.set_client_identity(client_identity);
+    std::promise<void> client_ready;
+    client.set_on_ready_callback([&]() { client_ready.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    auto client_stream = client.start_stream();
+    client_stream->set_data_handler([&](const ObscuraProto::byte_vector& data) {
+        std::string msg(data.begin(), data.end());
+        EXPECT_EQ(msg, "echo");
+        client_got_data.set_value();
+    });
+    client_stream->write(ObscuraProto::byte_vector{'h', 'e', 'l', 'l', 'o'});
+    ASSERT_EQ(server_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    ASSERT_EQ(client_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.disconnect();
+    server.stop();
+}
+
+TEST_F(WsIntegrationTest, AnonymousStreamRouting) {
+    ObscuraProto::net::WsServerWrapper server(server_sign_key);
+    std::promise<void> server_got_stream;
+    std::promise<void> server_got_data;
+    server.register_anon_stream_handler(OP_PING, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        EXPECT_TRUE(stream->get_op_code().has_value());
+        EXPECT_EQ(stream->get_op_code().value(), OP_PING);
+        server_got_stream.set_value();
+        stream->set_data_handler([&](const ObscuraProto::byte_vector& data) {
+            std::string msg(data.begin(), data.end());
+            EXPECT_EQ(msg, "anon data");
+            server_got_data.set_value();
+        });
+    });
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
+    std::promise<void> client_ready;
+    client.set_on_ready_callback([&]() { client_ready.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    auto client_stream = client.start_stream(OP_PING);
+    ASSERT_EQ(server_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client_stream->write(ObscuraProto::byte_vector{'a', 'n', 'o', 'n', ' ', 'd', 'a', 't', 'a'});
+    ASSERT_EQ(server_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.disconnect();
+    server.stop();
+}
+
+TEST_F(WsIntegrationTest, ServerInitiatedOpCodeStream) {
+    auto client_identity = ObscuraProto::Crypto::generate_sign_keypair();
+    ObscuraProto::net::WsConnectionHdl client_hdl;
+
+    ObscuraProto::net::WsServerWrapper server(server_sign_key);
+    std::promise<void> server_got_ready;
+    std::promise<void> client_got_stream;
+    std::promise<void> client_got_data;
+    server.set_client_identity_handler(
+        [&](auto hdl, ObscuraProto::PublicKey pk) -> bool { return pk.data == client_identity.publicKey.data; });
+    server.register_op_handler(OP_PING, [&](auto hdl, ObscuraProto::Payload) {
+        client_hdl = hdl;
+        server_got_ready.set_value();
+    });
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
+    client.set_client_identity(client_identity);
+    client.register_stream_handler(OP_ECHO, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        EXPECT_TRUE(stream->get_op_code().has_value());
+        EXPECT_EQ(stream->get_op_code().value(), OP_ECHO);
+        client_got_stream.set_value();
+        stream->set_data_handler([&](const ObscuraProto::byte_vector& data) {
+            std::string msg(data.begin(), data.end());
+            EXPECT_EQ(msg, "from server");
+            client_got_data.set_value();
+        });
+    });
+    std::promise<void> client_ready;
+    client.set_on_ready_callback([&]() { client_ready.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.send(ObscuraProto::PayloadBuilder(OP_PING).build());
+    ASSERT_EQ(server_got_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    auto server_stream = server.start_stream(client_hdl, OP_ECHO);
+    ASSERT_EQ(client_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    server_stream->write(ObscuraProto::byte_vector{'f', 'r', 'o', 'm', ' ', 's', 'e', 'r', 'v', 'e', 'r'});
+    ASSERT_EQ(client_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.disconnect();
+    server.stop();
+}
+
+TEST_F(WsIntegrationTest, AnonServerInitiatedOpCodeStream) {
+    ObscuraProto::net::WsServerWrapper server(server_sign_key);
+    std::promise<void> client_got_stream;
+    std::promise<void> client_got_data;
+    server.register_anon_op_handler(OP_PING, [&](auto hdl, ObscuraProto::Payload) {
+        auto server_stream = server.start_stream(hdl, OP_ECHO);
+        server_stream->write(
+            ObscuraProto::byte_vector{'a', 'n', 'o', 'n', ' ', 's', 'r', 'v', ' ', 'd', 'a', 't', 'a'});
+    });
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
+    client.register_stream_handler(OP_ECHO, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        EXPECT_TRUE(stream->get_op_code().has_value());
+        EXPECT_EQ(stream->get_op_code().value(), OP_ECHO);
+        client_got_stream.set_value();
+        stream->set_data_handler([&](const ObscuraProto::byte_vector& data) {
+            std::string msg(data.begin(), data.end());
+            EXPECT_EQ(msg, "anon srv data");
+            client_got_data.set_value();
+        });
+    });
+    std::promise<void> client_ready;
+    client.set_on_ready_callback([&]() { client_ready.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.send(ObscuraProto::PayloadBuilder(OP_PING).build());
+    ASSERT_EQ(client_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    ASSERT_EQ(client_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.disconnect();
+    server.stop();
+}
+
+// ========== Version configuration tests ==========
+
+TEST_F(WsIntegrationTest, V1_0OnlyServer) {
+    ObscuraProto::Config cfg = ObscuraProto::Config::with_defaults();
+    cfg.supported_versions = {ObscuraProto::Versions::V1_0};
+
+    ObscuraProto::net::WsServerWrapper server(server_sign_key, cfg);
+    std::promise<void> server_got_stream;
+    std::promise<void> server_got_data;
+    server.register_incoming_stream_handler([&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        EXPECT_FALSE(stream->get_op_code().has_value());
+        server_got_stream.set_value();
+        stream->set_data_handler([&](const ObscuraProto::byte_vector& data) {
+            std::string msg(data.begin(), data.end());
+            EXPECT_EQ(msg, "v1.0 data");
+            server_got_data.set_value();
+        });
+    });
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
+    std::promise<void> client_ready;
+    client.set_on_ready_callback([&]() { client_ready.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    auto stream = client.start_stream(OP_ECHO);
+    ASSERT_EQ(server_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    stream->write(ObscuraProto::byte_vector{'v', '1', '.', '0', ' ', 'd', 'a', 't', 'a'});
+    ASSERT_EQ(server_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.disconnect();
+    server.stop();
+}
+
+TEST_F(WsIntegrationTest, V1_0OnlyClient) {
+    ObscuraProto::Config cfg = ObscuraProto::Config::with_defaults();
+    cfg.supported_versions = {ObscuraProto::Versions::V1_0};
+
+    ObscuraProto::net::WsServerWrapper server(server_sign_key);
+    std::promise<void> server_got_stream;
+    std::promise<void> server_got_data;
+    server.register_incoming_stream_handler([&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        EXPECT_FALSE(stream->get_op_code().has_value());
+        server_got_stream.set_value();
+        stream->set_data_handler([&](const ObscuraProto::byte_vector& data) {
+            std::string msg(data.begin(), data.end());
+            EXPECT_EQ(msg, "from v1.0 client");
+            server_got_data.set_value();
+        });
+    });
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key, cfg);
+    std::promise<void> client_ready;
+    client.set_on_ready_callback([&]() { client_ready.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    auto stream = client.start_stream(OP_ECHO);
+    ASSERT_EQ(server_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    stream->write(
+        ObscuraProto::byte_vector{'f', 'r', 'o', 'm', ' ', 'v', '1', '.', '0', ' ', 'c', 'l', 'i', 'e', 'n', 't'});
+    ASSERT_EQ(server_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.disconnect();
+    server.stop();
+}
+
+TEST_F(WsIntegrationTest, V1_1OnlyBothSides) {
+    auto client_identity = ObscuraProto::Crypto::generate_sign_keypair();
+    ObscuraProto::Config cfg = ObscuraProto::Config::with_defaults();
+    cfg.supported_versions = {ObscuraProto::Versions::V1_1};
+
+    ObscuraProto::net::WsServerWrapper server(server_sign_key, cfg);
+    std::promise<void> server_got_stream;
+    std::promise<void> server_got_data;
+    std::promise<void> client_got_data;
+    server.set_client_identity_handler(
+        [&](auto hdl, ObscuraProto::PublicKey pk) -> bool { return pk.data == client_identity.publicKey.data; });
+    server.register_stream_handler(OP_ECHO, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        EXPECT_TRUE(stream->get_op_code().has_value());
+        EXPECT_EQ(stream->get_op_code().value(), OP_ECHO);
+        server_got_stream.set_value();
+        stream->set_data_handler([stream, &server_got_data](const ObscuraProto::byte_vector& data) {
+            std::string msg(data.begin(), data.end());
+            EXPECT_EQ(msg, "v1.1 data");
+            server_got_data.set_value();
+            stream->write(ObscuraProto::byte_vector{'v', '1', '.', '1', ' ', 'o', 'k'});
+        });
+    });
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key, cfg);
+    client.set_client_identity(client_identity);
+    std::promise<void> client_ready;
+    client.set_on_ready_callback([&]() { client_ready.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    auto stream = client.start_stream(OP_ECHO);
+    ASSERT_EQ(server_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    stream->set_data_handler([&](const ObscuraProto::byte_vector& data) {
+        std::string msg(data.begin(), data.end());
+        EXPECT_EQ(msg, "v1.1 ok");
+        client_got_data.set_value();
+    });
+    stream->write(ObscuraProto::byte_vector{'v', '1', '.', '1', ' ', 'd', 'a', 't', 'a'});
+    ASSERT_EQ(server_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    ASSERT_EQ(client_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client.disconnect();
+    server.stop();
+}
+
+TEST_F(WsIntegrationTest, NoCommonVersion) {
+    ObscuraProto::Config server_cfg = ObscuraProto::Config::with_defaults();
+    server_cfg.supported_versions = {ObscuraProto::Versions::V1_1};
+
+    ObscuraProto::Config client_cfg = ObscuraProto::Config::with_defaults();
+    client_cfg.supported_versions = {ObscuraProto::Versions::V1_0};
+
+    ObscuraProto::net::WsServerWrapper server(server_sign_key, server_cfg);
+    server.run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key, client_cfg);
+    std::promise<void> client_disconnected;
+    std::atomic<bool> handshake_ok{false};
+    client.set_on_ready_callback([&]() { handshake_ok = true; });
+    client.set_on_disconnect_callback([&]() { client_disconnected.set_value(); });
+    client.connect("ws://localhost:" + std::to_string(port));
+
+    EXPECT_EQ(client_disconnected.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    EXPECT_FALSE(handshake_ok.load());
+
+    server.stop();
+}

@@ -13,10 +13,11 @@ namespace ObscuraProto {
 
     namespace Versions {
         constexpr Version V1_0 = 0x0100;
+        constexpr Version V1_1 = 0x0101;
     }
 
     // A list of supported versions, in descending order of preference.
-    const std::vector<Version> SUPPORTED_VERSIONS = {Versions::V1_0};
+    const std::vector<Version> SUPPORTED_VERSIONS = {Versions::V1_1, Versions::V1_0};
 
     /**
      * @brief Handles the logic for negotiating a common protocol version.

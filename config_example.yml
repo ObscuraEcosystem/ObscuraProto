@@ -25,6 +25,12 @@ server:
     idle_ms: 300000                  # max idle time before disconnect (0 = unlimited)
     check_interval_ms: 5000          # how often to check for timeouts
 
+  # Protocol versions to support, in descending order of preference.
+  # The server will negotiate the highest common version with the client.
+  # Change this to restrict which protocol versions are accepted.
+  # Example: supported_versions: [0x0101, 0x0100]  # V1_1 and V1_0
+  supported_versions: [0x0101, 0x0100]   # V1_1 first, then V1_0
+
 # Default reserved opcodes. Can be changed if they conflict with application opcodes.
 # Both client and server MUST use the same values.
 opcodes:

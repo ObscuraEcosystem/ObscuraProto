@@ -9,7 +9,7 @@ namespace ObscuraProto {
     namespace net {
 
         WsClientWrapper::WsClientWrapper(KeyPair server_sign_key, Config config) : config_(std::move(config)) {
-            session_ = std::make_unique<Session>(Role::CLIENT, std::move(server_sign_key));
+            session_ = std::make_unique<Session>(Role::CLIENT, std::move(server_sign_key), config_.supported_versions);
             client_.init_asio();
             client_.set_open_handler(std::bind(&WsClientWrapper::on_open, this, std::placeholders::_1));
             client_.set_close_handler(std::bind(&WsClientWrapper::on_close, this, std::placeholders::_1));
@@ -161,6 +161,35 @@ namespace ObscuraProto {
             return stream;
         }
 
+        std::shared_ptr<Stream> WsClientWrapper::start_stream(Payload::OpCode stream_op_code) {
+            uint32_t stream_id = next_outgoing_stream_id_++ * 2;
+
+            auto stream = std::make_shared<Stream>(
+                stream_id, [this](const Payload& p) { send(p); }, stream_op_code);
+
+            {
+                std::lock_guard<std::mutex> lock(streams_mutex_);
+                active_streams_[stream_id] = stream;
+            }
+
+            const auto& oc = config_.opcodes;
+            auto version = session_->get_selected_version();
+            PayloadBuilder builder(oc.STREAM_START);
+            builder.add_param(stream_id);
+            if (version.has_value() && version.value() >= Versions::V1_1) {
+                builder.add_param(static_cast<uint16_t>(stream_op_code));
+            }
+            send(builder.build());
+
+            return stream;
+        }
+
+        void WsClientWrapper::register_stream_handler(Payload::OpCode op_code,
+                                                      std::function<void(std::shared_ptr<Stream>)> callback) {
+            std::lock_guard<std::mutex> lock(stream_handlers_mutex_);
+            stream_handlers_[op_code] = std::move(callback);
+        }
+
         void WsClientWrapper::register_incoming_stream_handler(std::function<void(std::shared_ptr<Stream>)> callback) {
             incoming_stream_handler_ = std::move(callback);
         }
@@ -277,12 +306,31 @@ namespace ObscuraProto {
                         uint32_t stream_id = reader.read_param<uint32_t>();
 
                         if (payload.op_code == oc.STREAM_START) {
-                            auto stream = std::make_shared<Stream>(stream_id, [this](const Payload& p) { send(p); });
+                            std::optional<Payload::OpCode> stream_op_code = std::nullopt;
+                            if (reader.has_more()) {
+                                stream_op_code = reader.read_param<uint16_t>();
+                            }
+
+                            auto stream = std::make_shared<Stream>(
+                                stream_id, [this](const Payload& p) { send(p); }, stream_op_code);
                             {
                                 std::lock_guard<std::mutex> lock(streams_mutex_);
                                 active_streams_[stream_id] = stream;
                             }
-                            if (incoming_stream_handler_) {
+
+                            bool handled = false;
+                            std::function<void(std::shared_ptr<Stream>)> stream_handler;
+                            if (stream_op_code.has_value()) {
+                                std::lock_guard<std::mutex> lock(stream_handlers_mutex_);
+                                auto it = stream_handlers_.find(*stream_op_code);
+                                if (it != stream_handlers_.end()) {
+                                    stream_handler = it->second;
+                                    handled = true;
+                                }
+                            }
+                            if (stream_handler) {
+                                stream_handler(std::move(stream));
+                            } else if (!handled && incoming_stream_handler_) {
                                 incoming_stream_handler_(std::move(stream));
                             }
                         } else if (payload.op_code == oc.STREAM_DATA) {

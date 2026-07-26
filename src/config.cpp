@@ -148,6 +148,25 @@ namespace ObscuraProto {
                     cfg.opcodes.STREAM_END = static_cast<uint16_t>(parse_uint32(value));
                 } else if (key == "STREAM_CANCEL") {
                     cfg.opcodes.STREAM_CANCEL = static_cast<uint16_t>(parse_uint32(value));
+                } else if (key == "supported_versions") {
+                    // Format: [0x0101, 0x0100]
+                    std::vector<Version> versions;
+                    size_t pos = 0;
+                    while (pos < value.size()) {
+                        // Find next hex number after '[' or ',' or space
+                        auto start = value.find_first_of("0123456789xXabcdefABCDEF", pos);
+                        if (start == std::string::npos)
+                            break;
+                        auto end = value.find_first_not_of("0123456789xXabcdefABCDEF", start);
+                        if (end == std::string::npos)
+                            end = value.size();
+                        std::string num_str = value.substr(start, end - start);
+                        versions.push_back(static_cast<Version>(std::stoul(num_str, nullptr, 16)));
+                        pos = end;
+                    }
+                    if (!versions.empty()) {
+                        cfg.supported_versions = versions;
+                    }
                 }
             } catch (const std::exception& e) {
                 std::cerr << "[ObscuraProto] Warning: invalid value at line " << line_num << " ('" << value

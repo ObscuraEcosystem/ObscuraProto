@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 
 #include "packet.hpp"
 
@@ -16,11 +17,16 @@ namespace ObscuraProto {
         using CancelHandler = std::function<void()>;
         using SendFn = std::function<void(Payload)>;
 
-        Stream(uint32_t stream_id, SendFn send_fn) : stream_id_(stream_id), send_fn_(std::move(send_fn)) {
+        Stream(uint32_t stream_id, SendFn send_fn, std::optional<Payload::OpCode> op_code = std::nullopt)
+            : stream_id_(stream_id), send_fn_(std::move(send_fn)), op_code_(op_code) {
         }
 
         uint32_t get_stream_id() const {
             return stream_id_;
+        }
+
+        std::optional<Payload::OpCode> get_op_code() const {
+            return op_code_;
         }
 
         void write(const byte_vector& data);
@@ -53,6 +59,7 @@ namespace ObscuraProto {
     private:
         uint32_t stream_id_;
         SendFn send_fn_;
+        std::optional<Payload::OpCode> op_code_;
 
         DataHandler on_data_;
         EndHandler on_end_;

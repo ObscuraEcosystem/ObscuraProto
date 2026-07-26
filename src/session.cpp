@@ -9,9 +9,10 @@
 
 namespace ObscuraProto {
 
-    Session::Session(Role role, KeyPair server_sign_key) : role_(role), server_sign_key_(std::move(server_sign_key)) {
-        // For a client, the private key part of server_sign_key_ should be empty.
-        // For a server, both parts should be present.
+    Session::Session(Role role, KeyPair server_sign_key, std::vector<Version> supported_versions)
+        : role_(role),
+          server_sign_key_(std::move(server_sign_key)),
+          supported_versions_(std::move(supported_versions)) {
     }
 
     Session::~Session() {
@@ -49,7 +50,7 @@ namespace ObscuraProto {
 
         // 2. Create the ClientHello message
         ClientHello hello;
-        hello.supported_versions = SUPPORTED_VERSIONS;
+        hello.supported_versions = supported_versions_;
         hello.ephemeral_pk = ephemeral_kx_kp_->publicKey;
 
         // 3. Include client identity if set
@@ -68,7 +69,7 @@ namespace ObscuraProto {
         }
 
         // 1. Select a compatible protocol version.
-        auto chosen_version = VersionNegotiator::negotiate(client_hello.supported_versions, SUPPORTED_VERSIONS);
+        auto chosen_version = VersionNegotiator::negotiate(client_hello.supported_versions, supported_versions_);
 
         if (!chosen_version) {
             throw RuntimeError("Client and server have no supported protocol versions in common.");
@@ -115,7 +116,7 @@ namespace ObscuraProto {
 
         // 1. Verify that the server selected a version we support
         bool version_is_supported = false;
-        for (const auto& supported_ver : SUPPORTED_VERSIONS) {
+        for (const auto& supported_ver : supported_versions_) {
             if (server_hello.selected_version == supported_ver) {
                 version_is_supported = true;
                 break;

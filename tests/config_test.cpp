@@ -36,6 +36,10 @@ namespace ObscuraProto {
             EXPECT_EQ(cfg.opcodes.STREAM_DATA, 0xFFFC);
             EXPECT_EQ(cfg.opcodes.STREAM_END, 0xFFFB);
             EXPECT_EQ(cfg.opcodes.STREAM_CANCEL, 0xFFFA);
+
+            ASSERT_EQ(cfg.supported_versions.size(), 2u);
+            EXPECT_EQ(cfg.supported_versions[0], Versions::V1_1);
+            EXPECT_EQ(cfg.supported_versions[1], Versions::V1_0);
         }
 
         std::string write_test_yaml(const std::string& content) {
@@ -107,6 +111,33 @@ opcodes:
             EXPECT_EQ(cfg.opcodes.STREAM_DATA, 0xFFFCu);
             EXPECT_EQ(cfg.opcodes.STREAM_END, 0xFFFBu);
             EXPECT_EQ(cfg.opcodes.STREAM_CANCEL, 0xFFFAu);
+        }
+
+        TEST(ConfigTest, LoadsSupportedVersionsFromYaml) {
+            std::string yaml = R"(
+server:
+  supported_versions: [0x0101, 0x0100]
+)";
+            std::string path = write_test_yaml(yaml);
+            Config cfg = Config::from_yaml(path);
+            std::remove(path.c_str());
+
+            ASSERT_EQ(cfg.supported_versions.size(), 2u);
+            EXPECT_EQ(cfg.supported_versions[0], Versions::V1_1);
+            EXPECT_EQ(cfg.supported_versions[1], Versions::V1_0);
+        }
+
+        TEST(ConfigTest, LoadsSingleVersionFromYaml) {
+            std::string yaml = R"(
+server:
+  supported_versions: [0x0100]
+)";
+            std::string path = write_test_yaml(yaml);
+            Config cfg = Config::from_yaml(path);
+            std::remove(path.c_str());
+
+            ASSERT_EQ(cfg.supported_versions.size(), 1u);
+            EXPECT_EQ(cfg.supported_versions[0], Versions::V1_0);
         }
 
         TEST(ConfigTest, MissingFileUsesDefaults) {

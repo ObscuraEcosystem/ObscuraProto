@@ -22,8 +22,11 @@ namespace ObscuraProto {
          * @param role Whether this session belongs to a client or a server.
          * @param server_sign_key For a server, its long-term signing key pair.
          *                        For a client, a key pair with only the public key part filled.
+         * @param supported_versions The list of protocol versions this session supports,
+         *                           in descending order of preference.
+         *                           Defaults to the global SUPPORTED_VERSIONS.
          */
-        Session(Role role, KeyPair server_sign_key);
+        Session(Role role, KeyPair server_sign_key, std::vector<Version> supported_versions = SUPPORTED_VERSIONS);
         ~Session();
 
         Session(const Session&) = delete;
@@ -109,6 +112,7 @@ namespace ObscuraProto {
         Role role_;
         bool handshake_complete_ = false;
         std::optional<Version> selected_version_ = std::nullopt;
+        std::vector<Version> supported_versions_;
 
         // Long-term signing key. For the server, this contains the private key.
         // For the client, this contains the server's public key.
