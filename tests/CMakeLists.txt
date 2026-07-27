@@ -20,7 +20,12 @@ add_executable(obscuraproto_tests
     handshake_messages_test.cpp
     version_negotiation_test.cpp
     client_auth_test.cpp
-    integration_test.cpp
+    integration/anonymous_test.cpp
+    integration/authenticated_test.cpp
+    integration/stream_routing_test.cpp
+    integration/version_config_test.cpp
+    integration/full_cycle_test.cpp
+    integration/server_edge_test.cpp
     rate_limiter_test.cpp
     config_test.cpp
     ws_lifecycle_test.cpp
