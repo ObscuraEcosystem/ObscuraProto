@@ -1,15 +1,13 @@
-## 1.1.0
-- Added protocol version V1_1 (`0x0101`) with opCode-routed streams.
-  - `Stream` now carries an optional `op_code_` field, accessible via `get_op_code()`.
-  - `start_stream(Payload::OpCode)` overload on both client and server — opens a stream tagged with an application-level opCode.
-  - `register_stream_handler(Payload::OpCode, callback)` — registers a dedicated handler for incoming streams with a specific opCode.
-  - `register_anon_stream_handler(Payload::OpCode, callback)` — same for anonymous sessions.
-  - If no specific handler matches, the stream falls through to `incoming_stream_handler_` (backward compatible).
-  - On V1_0 negotiation (e.g. old peer), `start_stream(opCode)` transparently falls back to legacy format — no opCode in `STREAM_START`.
-- Configurable protocol versions: added `supported_versions` field to `Config`.
-  - Developer can now specify which protocol versions to support (e.g. `{V1_0}`, `{V1_1}`, or the default `{V1_1, V1_0}`).
-  - `Session` constructor accepts a custom version list; `WsClientWrapper`/`WsServerWrapper` propagate it from `Config`.
-  - Parsed from YAML config (`supported_versions: [0x0101, 0x0100]`) via `Config::from_yaml()`.
-  - When no common version exists between client and server, the handshake fails cleanly with a `RuntimeError`.
-- Fixed thread safety: stream handler callbacks are now copied out of `stream_handlers_mutex_` before invocation, preventing potential deadlock if the handler calls `register_stream_handler()`.
-- `SUPPORTED_VERSIONS` now includes V1_1 as the preferred version (`{V1_1, V1_0}`).
+## 1.1.1
+
+### Added
+- `Crypto::keypair_from_seed(const uint8_t* seed, size_t len)` — deterministic Ed25519 key pair derivation from a 32-byte seed (`crypto_sign_seed_keypair`). Throws `InvalidArgument` on a wrong seed length and `RuntimeError` if expansion fails.
+- `Crypto::derive_public_key(const uint8_t* private_key, size_t len)` — derives the Ed25519 public key from a 64-byte private key (`crypto_sign_ed25519_sk_to_pk`). Throws `InvalidArgument` on a wrong private key length.
+- C++ tests for both new APIs (`CryptoTest.KeypairFromSeed`, `CryptoTest.DerivePublicKey`, `CryptoTest.SeedConsistency`).
+
+### Changed
+- CMake project version bumped to `1.1.1` (`project(ObscuraProto VERSION 1.1.1)`).
+
+### Fixed
+- Rust wrapper `secure_wipe`: removed the intermediate `std::vector` copy of the secret (the wrapper previously copied the buffer via `ObscuraProto::secure_wipe(tmp)` and wiped only the copy, while `rust::Vec` was then zeroed in place with `sodium_memzero`). The buffer is now zeroed in place directly with `sodium_memzero`, then cleared — no duplicate secret material is ever created.
+- Rust wrapper: key pair derivation is now fully delegated to the library — `make_keypair_from_sign_key` uses `Crypto::keypair_from_seed` / `Crypto::derive_public_key`. The last direct libsodium call in `wrapper.cpp` is removed. The 32/64-byte contract is preserved; the public Rust API is unchanged.

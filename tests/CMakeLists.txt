@@ -26,6 +26,7 @@ add_executable(obscuraproto_tests
     integration/version_config_test.cpp
     integration/full_cycle_test.cpp
     integration/server_edge_test.cpp
+    integration/request_timeout_test.cpp
     rate_limiter_test.cpp
     config_test.cpp
     ws_lifecycle_test.cpp
