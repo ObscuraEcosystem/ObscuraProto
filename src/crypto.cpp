@@ -52,6 +52,29 @@ namespace ObscuraProto {
         return kp;
     }
 
+    KeyPair Crypto::keypair_from_seed(const uint8_t* seed, size_t len) {
+        if (len != crypto_sign_SEEDBYTES) {
+            throw InvalidArgument("Seed must be exactly 32 bytes.");
+        }
+        KeyPair kp;
+        kp.publicKey.data.resize(crypto_sign_PUBLICKEYBYTES);
+        kp.privateKey.data.resize(crypto_sign_SECRETKEYBYTES);
+        if (crypto_sign_seed_keypair(kp.publicKey.data.data(), kp.privateKey.data.data(), seed) != 0) {
+            throw RuntimeError("Seed expansion failed.");
+        }
+        return kp;
+    }
+
+    PublicKey Crypto::derive_public_key(const uint8_t* private_key, size_t len) {
+        if (len != crypto_sign_SECRETKEYBYTES) {
+            throw InvalidArgument("Private key must be exactly 64 bytes.");
+        }
+        PublicKey pk;
+        pk.data.resize(crypto_sign_PUBLICKEYBYTES);
+        crypto_sign_ed25519_sk_to_pk(pk.data.data(), private_key);
+        return pk;
+    }
+
     Signature Crypto::sign(const byte_vector& message, const PrivateKey& private_key) {
         if (private_key.data.size() != crypto_sign_SECRETKEYBYTES) {
             throw InvalidArgument("Invalid private key size for signing.");

@@ -41,6 +41,25 @@ namespace ObscuraProto {
         static KeyPair generate_sign_keypair();
 
         /**
+         * @brief Deterministically derives a key pair from a 32-byte seed (Ed25519).
+         * @param seed The 32-byte seed.
+         * @param len The seed length in bytes (must be exactly 32).
+         * @return A KeyPair object.
+         * @throws ObscuraProto::InvalidArgument if len is not crypto_sign_SEEDBYTES.
+         * @throws ObscuraProto::RuntimeError if seed expansion fails.
+         */
+        static KeyPair keypair_from_seed(const uint8_t* seed, size_t len);
+
+        /**
+         * @brief Derives the Ed25519 public key from a 64-byte private key.
+         * @param private_key The 64-byte private key (seed || public).
+         * @param len The private key length in bytes (must be exactly 64).
+         * @return A PublicKey object.
+         * @throws ObscuraProto::InvalidArgument if len is not crypto_sign_SECRETKEYBYTES.
+         */
+        static PublicKey derive_public_key(const uint8_t* private_key, size_t len);
+
+        /**
          * @brief Creates a digital signature for a given message.
          * @param message The data to sign.
          * @param private_key The signer's private key.

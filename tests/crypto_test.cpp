@@ -108,3 +108,99 @@ TEST(SessionTest, HandshakeFailure) {
     ASSERT_THROW(client_session.client_finalize_handshake(server_hello), ObscuraProto::RuntimeError);
     ASSERT_FALSE(client_session.is_handshake_complete());
 }
+
+// A deterministic 32-byte Ed25519 seed for reproducible tests.
+static std::vector<uint8_t> make_test_seed() {
+    std::vector<uint8_t> seed(32);
+    for (size_t i = 0; i < seed.size(); ++i) {
+        seed[i] = static_cast<uint8_t>(0xA0 + i);
+    }
+    return seed;
+}
+
+// Converts a hex string into a byte vector (used for fixed external test vectors).
+static std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
+    std::vector<uint8_t> bytes;
+    bytes.reserve(hex.size() / 2);
+    for (size_t i = 0; i < hex.size(); i += 2) {
+        bytes.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+    }
+    return bytes;
+}
+
+TEST(CryptoTest, KeypairFromSeed) {
+    ASSERT_EQ(ObscuraProto::Crypto::init(), 0);
+
+    auto seed = make_test_seed();
+    auto kp = ObscuraProto::Crypto::keypair_from_seed(seed.data(), seed.size());
+    ASSERT_EQ(kp.publicKey.data.size(), crypto_sign_PUBLICKEYBYTES);
+    ASSERT_EQ(kp.privateKey.data.size(), crypto_sign_SECRETKEYBYTES);
+
+    // Invalid seed lengths must throw.
+    std::vector<uint8_t> short_seed(31, 0x01);
+    ASSERT_THROW(ObscuraProto::Crypto::keypair_from_seed(short_seed.data(), short_seed.size()),
+                 ObscuraProto::InvalidArgument);
+    std::vector<uint8_t> long_seed(33, 0x01);
+    ASSERT_THROW(ObscuraProto::Crypto::keypair_from_seed(long_seed.data(), long_seed.size()),
+                 ObscuraProto::InvalidArgument);
+}
+
+TEST(CryptoTest, DerivePublicKey) {
+    ASSERT_EQ(ObscuraProto::Crypto::init(), 0);
+
+    auto seed = make_test_seed();
+    auto kp = ObscuraProto::Crypto::keypair_from_seed(seed.data(), seed.size());
+
+    auto pk = ObscuraProto::Crypto::derive_public_key(kp.privateKey.data.data(), kp.privateKey.data.size());
+    ASSERT_EQ(pk.data.size(), crypto_sign_PUBLICKEYBYTES);
+
+    // Invalid private key length must throw.
+    std::vector<uint8_t> short_sk(63, 0x01);
+    ASSERT_THROW(ObscuraProto::Crypto::derive_public_key(short_sk.data(), short_sk.size()),
+                 ObscuraProto::InvalidArgument);
+}
+
+TEST(CryptoTest, SeedConsistency) {
+    ASSERT_EQ(ObscuraProto::Crypto::init(), 0);
+
+    auto seed = make_test_seed();
+    auto kp = ObscuraProto::Crypto::keypair_from_seed(seed.data(), seed.size());
+
+    // Public key derived from the private key must match the keypair's public key.
+    auto derived_pk = ObscuraProto::Crypto::derive_public_key(kp.privateKey.data.data(), kp.privateKey.data.size());
+    ASSERT_EQ(derived_pk, kp.publicKey);
+
+    // The derived keypair must be usable end-to-end (sign + verify).
+    ObscuraProto::byte_vector message = {0x01, 0x02, 0x03, 0x04, 0x05};
+    auto sig = ObscuraProto::Crypto::sign(message, kp.privateKey);
+    ASSERT_TRUE(ObscuraProto::Crypto::verify(sig, message, derived_pk));
+
+    // A different seed must produce a different keypair.
+    std::vector<uint8_t> other_seed(32, 0x42);
+    auto other_kp = ObscuraProto::Crypto::keypair_from_seed(other_seed.data(), other_seed.size());
+    ASSERT_NE(other_kp.publicKey, kp.publicKey);
+}
+
+// RFC 8032 (Ed25519) Test 1: fixed seed, public key and private key (seed || pk).
+// Pins external consistency of seed expansion against the RFC reference vector,
+// not just internal keypair consistency.
+TEST(CryptoTest, KeypairFromSeedMatchesRfc8032) {
+    ASSERT_EQ(ObscuraProto::Crypto::init(), 0);
+
+    const std::string seed_hex = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    const std::string pk_hex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    auto seed = hex_to_bytes(seed_hex);
+    auto expected_pk = hex_to_bytes(pk_hex);
+    auto expected_sk = seed;
+    expected_sk.insert(expected_sk.end(), expected_pk.begin(), expected_pk.end());
+
+    auto kp = ObscuraProto::Crypto::keypair_from_seed(seed.data(), seed.size());
+    ASSERT_EQ(kp.publicKey.data, expected_pk);
+    std::vector<uint8_t> actual_sk(kp.privateKey.data.begin(), kp.privateKey.data.end());
+    ASSERT_EQ(actual_sk, expected_sk);
+
+    // The public key must also be recoverable from the RFC 8032 private key.
+    auto derived_pk = ObscuraProto::Crypto::derive_public_key(expected_sk.data(), expected_sk.size());
+    ASSERT_EQ(derived_pk.data, expected_pk);
+}
