@@ -1,5 +1,6 @@
 #include "obscuraproto/ws_client.hpp"
 
+#include <exception>
 #include <iostream>
 
 #include "obscuraproto/errors.hpp"
@@ -38,6 +39,13 @@ namespace ObscuraProto {
 
                 client_.connect(con);
 
+                // If a previous connection thread is still around (a
+                // self-disconnect from the io thread deferred its join), wait
+                // for it to finish before replacing the handle.
+                if (client_thread_ && client_thread_->joinable()) {
+                    client_thread_->join();
+                }
+
                 client_thread_ = std::make_unique<std::thread>(&WsClientWrapper::run_client, this);
 
             } catch (const std::exception& e) {
@@ -62,7 +70,12 @@ namespace ObscuraProto {
                     pair.second.set_exception(std::make_exception_ptr(RuntimeError("Client disconnected")));
                 }
                 pending_requests_.clear();
+                request_deadlines_.clear();
             }
+
+            // Wake the watchdog: deadlines were cleared and it must observe the
+            // stop flag set by stop_watchdog() below.
+            timeout_cv_.notify_all();
 
             if (is_connected_) {
                 try {
@@ -75,11 +88,106 @@ namespace ObscuraProto {
             }
 
             if (client_thread_->joinable()) {
+                if (std::this_thread::get_id() == client_thread_->get_id()) {
+                    // Self-join guard: disconnect() can be reached from the io
+                    // thread itself (e.g. the on_message catch block after a
+                    // user handler threw). Joining our own thread would
+                    // deadlock. The io loop has already been stopped above, so
+                    // this thread exits by itself right after the current
+                    // message handler returns. Keep the std::thread handle: a
+                    // later disconnect()/destructor from another thread joins
+                    // and releases it.
+                    is_connected_ = false;
+                    return;
+                }
                 client_thread_->join();
             }
 
             client_thread_.reset();
             is_connected_ = false;
+
+            // The watchdog must exit before the destructor finishes: it accesses
+            // this instance's members. Safe to join here (never called from the
+            // watchdog thread itself).
+            stop_watchdog();
+        }
+
+        uint32_t WsClientWrapper::resolve_request_timeout(uint32_t explicit_ms) const {
+            if (explicit_ms > 0) {
+                return explicit_ms;
+            }
+            if (config_.timeouts.enabled) {
+                return config_.timeouts.request_ms;
+            }
+            return 0;
+        }
+
+        void WsClientWrapper::ensure_watchdog() {
+            bool expected = false;
+            if (!watchdog_started_.compare_exchange_strong(expected, true)) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(watchdog_mutex_);
+            watchdog_stop_ = false;
+            watchdog_thread_ = std::make_unique<std::thread>(&WsClientWrapper::watchdog_loop, this);
+        }
+
+        void WsClientWrapper::stop_watchdog() {
+            std::unique_lock<std::mutex> lock(watchdog_mutex_);
+            if (!watchdog_thread_ || !watchdog_thread_->joinable()) {
+                watchdog_thread_.reset();
+                watchdog_started_ = false;
+                return;
+            }
+            watchdog_stop_ = true;
+            timeout_cv_.notify_all();
+            lock.unlock();
+            watchdog_thread_->join();
+            lock.lock();
+            watchdog_thread_.reset();
+            watchdog_started_ = false;
+        }
+
+        void WsClientWrapper::watchdog_loop() {
+            using clock = std::chrono::steady_clock;
+            std::unique_lock<std::mutex> lock(pending_requests_mutex_);
+            while (!watchdog_stop_) {
+                auto now = clock::now();
+                bool has_deadline = false;
+                clock::time_point earliest{};
+                for (const auto& [id, deadline] : request_deadlines_) {
+                    if (!has_deadline || deadline < earliest) {
+                        earliest = deadline;
+                        has_deadline = true;
+                    }
+                }
+                if (!has_deadline) {
+                    timeout_cv_.wait(lock);
+                    continue;
+                }
+                if (now >= earliest) {
+                    // Expire every request whose deadline has passed. The record is
+                    // removed atomically with the promise completion, so a late
+                    // response handler finds no entry and ignores the response —
+                    // std::promise::set_* is never called twice.
+                    std::exception_ptr eptr = std::make_exception_ptr(TimeoutError("Request timed out"));
+                    auto it = request_deadlines_.begin();
+                    while (it != request_deadlines_.end()) {
+                        if (it->second <= now) {
+                            auto pit = pending_requests_.find(it->first);
+                            if (pit != pending_requests_.end()) {
+                                pit->second.set_exception(eptr);
+                                pending_requests_.erase(pit);
+                            }
+                            it = request_deadlines_.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    continue;
+                }
+                timeout_cv_.wait_until(lock, earliest);
+            }
         }
 
         void WsClientWrapper::send(const Payload& payload) {
@@ -103,6 +211,10 @@ namespace ObscuraProto {
         }
 
         std::future<Payload> WsClientWrapper::async_request(const Payload& payload) {
+            return async_request(payload, 0);
+        }
+
+        std::future<Payload> WsClientWrapper::async_request(const Payload& payload, uint32_t timeout_ms) {
             if (!is_connected_ || !session_->is_handshake_complete()) {
                 throw LogicError("Session not ready for sending requests.");
             }
@@ -124,12 +236,44 @@ namespace ObscuraProto {
             auto promise = std::promise<Payload>();
             auto future = promise.get_future();
 
+            uint32_t effective_timeout = resolve_request_timeout(timeout_ms);
+
+            // The promise is registered BEFORE send(): a response that races
+            // back immediately must find its pending record, otherwise it would
+            // be dropped as "unknown request". If send() then fails (e.g. the
+            // connection closed concurrently after the readiness check), the
+            // record is removed and the promise completed with the exception —
+            // no orphaned entry can leak (unlimited config) and the returned
+            // future resolves instead of hanging.
             {
                 std::lock_guard<std::mutex> lock(pending_requests_mutex_);
                 pending_requests_[request_id] = std::move(promise);
+                if (effective_timeout > 0) {
+                    request_deadlines_[request_id] =
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout);
+                }
             }
 
-            send(request_payload);
+            if (effective_timeout > 0) {
+                ensure_watchdog();
+                timeout_cv_.notify_all();
+            }
+
+            try {
+                send(request_payload);
+            } catch (...) {
+                std::exception_ptr eptr = std::current_exception();
+                {
+                    std::lock_guard<std::mutex> lock(pending_requests_mutex_);
+                    auto it = pending_requests_.find(request_id);
+                    if (it != pending_requests_.end()) {
+                        it->second.set_exception(eptr);
+                        pending_requests_.erase(it);
+                    }
+                    request_deadlines_.erase(request_id);
+                }
+                std::rethrow_exception(eptr);
+            }
 
             return future;
         }
@@ -144,9 +288,15 @@ namespace ObscuraProto {
         }
 
         std::shared_ptr<Stream> WsClientWrapper::start_stream() {
-            uint32_t stream_id = next_outgoing_stream_id_++ * 2;
+            uint32_t stream_id = next_outgoing_stream_id_.fetch_add(1) * 2;
 
-            auto stream = std::make_shared<Stream>(stream_id, [this](const Payload& p) { send(p); });
+            auto stream = std::make_shared<Stream>(
+                stream_id, [weak = std::weak_ptr<WsClientWrapper>(weak_from_this())](const Payload& p) {
+                    // Silent drop: the owner client is gone (destroyed wrapper).
+                    if (auto owner = weak.lock()) {
+                        owner->send(p);
+                    }
+                });
 
             {
                 std::lock_guard<std::mutex> lock(streams_mutex_);
@@ -162,9 +312,17 @@ namespace ObscuraProto {
         }
 
         std::shared_ptr<Stream> WsClientWrapper::start_stream(Payload::OpCode stream_op_code) {
-            uint32_t stream_id = next_outgoing_stream_id_++ * 2;
+            uint32_t stream_id = next_outgoing_stream_id_.fetch_add(1) * 2;
 
-            auto stream = std::make_shared<Stream>(stream_id, [this](const Payload& p) { send(p); }, stream_op_code);
+            auto stream = std::make_shared<Stream>(
+                stream_id,
+                [weak = std::weak_ptr<WsClientWrapper>(weak_from_this())](const Payload& p) {
+                    // Silent drop: the owner client is gone (destroyed wrapper).
+                    if (auto owner = weak.lock()) {
+                        owner->send(p);
+                    }
+                },
+                stream_op_code);
 
             {
                 std::lock_guard<std::mutex> lock(streams_mutex_);
@@ -311,7 +469,14 @@ namespace ObscuraProto {
                             }
 
                             auto stream = std::make_shared<Stream>(
-                                stream_id, [this](const Payload& p) { send(p); }, stream_op_code);
+                                stream_id,
+                                [weak = std::weak_ptr<WsClientWrapper>(weak_from_this())](const Payload& p) {
+                                    // Silent drop: the owner client is gone (destroyed wrapper).
+                                    if (auto owner = weak.lock()) {
+                                        owner->send(p);
+                                    }
+                                },
+                                stream_op_code);
                             {
                                 std::lock_guard<std::mutex> lock(streams_mutex_);
                                 active_streams_[stream_id] = stream;
@@ -334,23 +499,42 @@ namespace ObscuraProto {
                             }
                         } else if (payload.op_code == oc.STREAM_DATA) {
                             byte_vector data = reader.read_param<byte_vector>();
-                            std::lock_guard<std::mutex> lock(streams_mutex_);
-                            auto it = active_streams_.find(stream_id);
-                            if (it != active_streams_.end()) {
-                                it->second->dispatch_data(std::move(data));
+                            std::shared_ptr<Stream> stream;
+                            {
+                                std::lock_guard<std::mutex> lock(streams_mutex_);
+                                auto it = active_streams_.find(stream_id);
+                                if (it != active_streams_.end()) {
+                                    stream = it->second;
+                                }
+                            }
+                            // Dispatch outside streams_mutex_: user handlers may call start_stream().
+                            if (stream) {
+                                stream->dispatch_data(std::move(data));
                             }
                         } else if (payload.op_code == oc.STREAM_END) {
-                            std::lock_guard<std::mutex> lock(streams_mutex_);
-                            auto it = active_streams_.find(stream_id);
-                            if (it != active_streams_.end()) {
-                                it->second->dispatch_end();
+                            std::shared_ptr<Stream> stream;
+                            {
+                                std::lock_guard<std::mutex> lock(streams_mutex_);
+                                auto it = active_streams_.find(stream_id);
+                                if (it != active_streams_.end()) {
+                                    stream = it->second;
+                                }
+                            }
+                            if (stream) {
+                                stream->dispatch_end();
                             }
                         } else if (payload.op_code == oc.STREAM_CANCEL) {
-                            std::lock_guard<std::mutex> lock(streams_mutex_);
-                            auto it = active_streams_.find(stream_id);
-                            if (it != active_streams_.end()) {
-                                it->second->dispatch_cancel();
-                                active_streams_.erase(it);
+                            std::shared_ptr<Stream> stream;
+                            {
+                                std::lock_guard<std::mutex> lock(streams_mutex_);
+                                auto it = active_streams_.find(stream_id);
+                                if (it != active_streams_.end()) {
+                                    stream = it->second;
+                                    active_streams_.erase(it);
+                                }
+                            }
+                            if (stream) {
+                                stream->dispatch_cancel();
                             }
                         }
 
@@ -404,9 +588,21 @@ namespace ObscuraProto {
         }
 
         Payload WsClientWrapper::sync_request(const Payload& payload) {
-            auto future_result = this->async_request(payload);
-            Payload result = future_result.get();
-            return result;
+            return sync_request(payload, 0);
+        }
+
+        Payload WsClientWrapper::sync_request(const Payload& payload, uint32_t timeout_ms) {
+            auto future_result = this->async_request(payload, timeout_ms);
+            uint32_t effective_timeout = resolve_request_timeout(timeout_ms);
+            if (effective_timeout == 0) {
+                return future_result.get();
+            }
+            if (future_result.wait_for(std::chrono::milliseconds(effective_timeout)) == std::future_status::timeout) {
+                // The watchdog completes the promise with TimeoutError shortly
+                // afterwards; throwing here unblocks the caller immediately.
+                throw TimeoutError("Request timed out");
+            }
+            return future_result.get();
         }
 
     }  // namespace net

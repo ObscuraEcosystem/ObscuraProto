@@ -29,9 +29,15 @@ namespace ObscuraProto {
             return op_code_;
         }
 
-        void write(const byte_vector& data);
-        void end();
-        void cancel();
+        // --- Outgoing data ---
+        // These three methods NEVER throw (noexcept). The send callback installed
+        // by the owning wrapper (WsClientWrapper/WsServerWrapper) captures a
+        // weak_ptr to the owner: once the owner is destroyed the callback is a
+        // silent no-op, and transport-level send failures are logged and
+        // swallowed by the wrapper. Data written to a dead stream is dropped.
+        void write(const byte_vector& data) noexcept;
+        void end() noexcept;
+        void cancel() noexcept;
 
         void set_data_handler(DataHandler handler) {
             on_data_ = std::move(handler);

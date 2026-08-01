@@ -58,6 +58,21 @@ namespace ObscuraProto {
         }
     };
 
+    /**
+     * @brief Exception thrown when a request exceeds its timeout budget.
+     *
+     * Raised by sync_request() (via wait_for) when the timeout expires before
+     * the response arrives, and delivered to async_request() futures whose
+     * deadline passed (std::future::get() rethrows it).
+     */
+    class TimeoutError : public RuntimeError {
+    public:
+        explicit TimeoutError(const std::string& message) : RuntimeError(message) {
+        }
+        explicit TimeoutError(const char* message) : RuntimeError(message) {
+        }
+    };
+
 }  // namespace ObscuraProto
 
 #endif  // OBSCURAPROTO_ERRORS_HPP

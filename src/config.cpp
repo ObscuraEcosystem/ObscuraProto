@@ -138,6 +138,8 @@ namespace ObscuraProto {
                     cfg.timeouts.idle_ms = parse_uint32(value);
                 } else if (key == "check_interval_ms") {
                     cfg.timeouts.check_interval_ms = parse_uint32(value);
+                } else if (key == "request_ms") {
+                    cfg.timeouts.request_ms = parse_uint32(value);
                 } else if (key == "RESPONSE") {
                     cfg.opcodes.RESPONSE = static_cast<uint16_t>(parse_uint32(value));
                 } else if (key == "STREAM_START") {

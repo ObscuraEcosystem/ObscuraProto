@@ -21,7 +21,7 @@
 namespace ObscuraProto {
     namespace net {
 
-        class WsServerWrapper {
+        class WsServerWrapper : public std::enable_shared_from_this<WsServerWrapper> {
         public:
             using OnPayloadCallback = std::function<void(WsConnectionHdl, Payload)>;
             using OnRequestCallback = std::function<Payload(WsConnectionHdl, PayloadReader&)>;
@@ -36,6 +36,16 @@ namespace ObscuraProto {
 
             void run(uint16_t port);
             void stop();
+
+            /**
+             * @brief Sends a payload to a specific client without waiting for a response.
+             * @param hdl The connection handle of the client.
+             * @param payload The payload to send.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending.
+             *
+             * Transport-level send failures are logged and swallowed (no exception
+             * escapes this call beyond the LogicError above).
+             */
             void send(WsConnectionHdl hdl, const Payload& payload);
 
             /**
@@ -51,16 +61,56 @@ namespace ObscuraProto {
              * @param hdl The connection handle of the client.
              * @param payload The payload to send as a request.
              * @return A future that will contain the response payload.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending requests.
+             *
+             * The default timeout (config_.timeouts.request_ms) applies; a 0 value in
+             * the config disables the deadline (unlimited). On timeout the future
+             * resolves with ObscuraProto::TimeoutError. The default timeout is enforced
+             * by the periodic timer (see check_timeouts()); the deadline is removed
+             * atomically with the promise completion, so a late response is ignored
+             * instead of double-completing the promise.
              */
             std::future<Payload> async_request(WsConnectionHdl hdl, const Payload& payload);
+
+            /**
+             * @brief Sends a request to a client and returns a future for the response, bounded by a timeout.
+             * @param hdl The connection handle of the client.
+             * @param payload The payload to send as a request.
+             * @param timeout_ms Maximum time to wait for the response in milliseconds
+             *                   (0 = use the default from config_.timeouts.request_ms;
+             *                   a 0 value in the config disables the deadline = unlimited).
+             * @return A future that will contain the response payload.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending requests.
+             *
+             * On timeout the future resolves with ObscuraProto::TimeoutError.
+             */
+            std::future<Payload> async_request(WsConnectionHdl hdl, const Payload& payload, uint32_t timeout_ms);
 
             /**
              * @brief Sends a request to a client and returns a response.
              * @param hdl The connection handle of the client.
              * @param payload The payload to send as a request.
              * @return A response payload.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending requests.
+             * @throws ObscuraProto::TimeoutError if the default timeout (config_.timeouts.request_ms,
+             *         where a 0 value disables the deadline) expires before the response arrives.
+             * @throws ObscuraProto::RuntimeError if the client disconnects while waiting.
              */
             Payload sync_request(WsConnectionHdl hdl, const Payload& payload);
+
+            /**
+             * @brief Sends a request to a client and returns a response, bounded by a timeout.
+             * @param hdl The connection handle of the client.
+             * @param payload The payload to send as a request.
+             * @param timeout_ms Maximum time to wait for the response in milliseconds
+             *                   (0 = use the default from config_.timeouts.request_ms;
+             *                   a 0 value in the config disables the deadline = unlimited).
+             * @return A response payload.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending requests.
+             * @throws ObscuraProto::TimeoutError if the timeout expires before the response arrives.
+             * @throws ObscuraProto::RuntimeError if the client disconnects while waiting.
+             */
+            Payload sync_request(WsConnectionHdl hdl, const Payload& payload, uint32_t timeout_ms);
 
             /**
              * @brief Registers a handler for a specific operation code.
@@ -235,10 +285,29 @@ namespace ObscuraProto {
             void schedule_timeout_check();
             void check_timeouts();
 
+            // Resolves the effective request timeout: an explicit (non-zero) value
+            // wins; otherwise the config default (config_.timeouts.request_ms; a 0
+            // value in the config disables the deadline = unlimited).
+            uint32_t resolve_request_timeout(uint32_t explicit_ms) const;
+
             WsServer server_;
             Config config_;
             RateLimiter rate_limiter_;
             KeyPair server_sign_key_;
+
+            // Protects sessions_ and anon_sessions_ (session lifecycle: creation in
+            // on_message, removal in on_close, lookup in send/async_request/send_anonymous/
+            // get_client_identity/check_timeouts/stop).
+            //
+            // LOCK ORDER (deadlock avoidance): sessions_mutex_ -> streams_mutex_ ->
+            // identity_map_mutex_. All other mutexes (pending_requests_mutex_,
+            // handshake_time_mutex_, op_handlers_mutex_, stream_handlers_mutex_,
+            // anon_stream_handlers_mutex_) are leaf mutexes and are never held while
+            // acquiring any of the three above.
+            //
+            // User callbacks (payload/request/stream/identity/close handlers) must never
+            // be invoked while sessions_mutex_ is held.
+            std::mutex sessions_mutex_;
 
             std::map<WsConnectionHdl, ConnectionState, std::owner_less<WsConnectionHdl>> sessions_;
             std::map<WsConnectionHdl, ConnectionState, std::owner_less<WsConnectionHdl>> anon_sessions_;
@@ -264,6 +333,14 @@ namespace ObscuraProto {
             std::mutex pending_requests_mutex_;
             std::map<WsConnectionHdl, std::map<uint32_t, std::promise<Payload>>, std::owner_less<WsConnectionHdl>>
                 pending_requests_;
+            // Per-request expiry deadlines, keyed like pending_requests_. Guarded by
+            // pending_requests_mutex_. check_timeouts() completes expired promises
+            // with TimeoutError and removes both records atomically, so a late
+            // response handler finds no entry and never double-completes a promise.
+            std::map<WsConnectionHdl,
+                     std::map<uint32_t, std::chrono::steady_clock::time_point>,
+                     std::owner_less<WsConnectionHdl>>
+                request_deadlines_;
             std::atomic<uint32_t> next_request_id_{0};
 
             // For streaming
@@ -271,7 +348,8 @@ namespace ObscuraProto {
             std::map<WsConnectionHdl, std::map<uint32_t, std::shared_ptr<Stream>>, std::owner_less<WsConnectionHdl>>
                 per_connection_streams_;
             std::function<void(std::shared_ptr<Stream>)> incoming_stream_handler_;
-            uint32_t next_outgoing_stream_id_ = 0;
+            // Atomic: incremented from user threads (start_stream) without holding a lock.
+            std::atomic<uint32_t> next_outgoing_stream_id_{0};
 
             // For op_code-routed streams (authenticated)
             std::mutex stream_handlers_mutex_;

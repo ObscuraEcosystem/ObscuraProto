@@ -1,5 +1,6 @@
 #include "obscuraproto/ws_server.hpp"
 
+#include <exception>
 #include <iostream>
 
 #include "obscuraproto/errors.hpp"
@@ -35,9 +36,10 @@ namespace ObscuraProto {
                 try {
                     server_.listen(port);
                     server_.start_accept();
-                    if (config_.timeouts.enabled && config_.timeouts.handshake_ms > 0 && config_.timeouts.idle_ms > 0) {
-                        schedule_timeout_check();
-                    }
+                    // The periodic check services idle/handshake timeouts and the
+                    // per-request deadline map (request_ms and explicit timeouts
+                    // passed to async_request/sync_request overloads).
+                    schedule_timeout_check();
                     server_.run();
                 } catch (const std::exception& e) {
                     std::cerr << "Server thread exception: " << e.what() << std::endl;
@@ -65,27 +67,33 @@ namespace ObscuraProto {
                     }
                 }
                 pending_requests_.clear();
+                request_deadlines_.clear();
             }
 
-            // Iterate over all authenticated connections and close them
-            for (auto const& [hdl, state] : sessions_) {
-                try {
-                    server_.close(hdl, websocketpp::close::status::going_away, "Server shutdown");
-                } catch (const websocketpp::exception& e) {
-                    // Ignore exceptions on close
+            // Iterate over all authenticated connections and close them.
+            // sessions_mutex_ is held while closing; on_close runs on the io thread
+            // and will wait for the lock, then find the maps already cleared.
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                for (auto const& [hdl, state] : sessions_) {
+                    try {
+                        server_.close(hdl, websocketpp::close::status::going_away, "Server shutdown");
+                    } catch (const websocketpp::exception& e) {
+                        // Ignore exceptions on close
+                    }
                 }
-            }
-            sessions_.clear();
+                sessions_.clear();
 
-            // Iterate over all anonymous connections and close them
-            for (auto const& [hdl, state] : anon_sessions_) {
-                try {
-                    server_.close(hdl, websocketpp::close::status::going_away, "Server shutdown");
-                } catch (const websocketpp::exception& e) {
-                    // Ignore exceptions on close
+                // Iterate over all anonymous connections and close them
+                for (auto const& [hdl, state] : anon_sessions_) {
+                    try {
+                        server_.close(hdl, websocketpp::close::status::going_away, "Server shutdown");
+                    } catch (const websocketpp::exception& e) {
+                        // Ignore exceptions on close
+                    }
                 }
+                anon_sessions_.clear();
             }
-            anon_sessions_.clear();
 
             {
                 std::lock_guard<std::mutex> lock(identity_map_mutex_);
@@ -94,6 +102,16 @@ namespace ObscuraProto {
             }
 
             if (server_thread_ && server_thread_->joinable()) {
+                if (std::this_thread::get_id() == server_thread_->get_id()) {
+                    // Self-join guard: stop() can be reached from the server io
+                    // thread itself (e.g. a user callback invoked during message
+                    // handling initiated the shutdown). Joining our own thread
+                    // would deadlock. Listening, timer and connection work has
+                    // already been torn down above, so the io loop drains and
+                    // this thread exits on its own. A later stop()/destructor
+                    // from another thread joins and releases it.
+                    return;
+                }
                 server_thread_->join();
             }
         }
@@ -108,6 +126,10 @@ namespace ObscuraProto {
         }
 
         void WsServerWrapper::send(WsConnectionHdl hdl, const Payload& payload) {
+            // Critical section: session lookup + encryption + transmit are serialized
+            // per session so concurrent sends cannot race the session keys. User
+            // callbacks are never invoked under this lock.
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
             Session* session = nullptr;
             auto it = sessions_.find(hdl);
             if (it != sessions_.end() && it->second.session.is_handshake_complete()) {
@@ -140,17 +162,26 @@ namespace ObscuraProto {
         }
 
         std::future<Payload> WsServerWrapper::async_request(WsConnectionHdl hdl, const Payload& payload) {
-            Session* session = nullptr;
-            auto it = sessions_.find(hdl);
-            if (it != sessions_.end() && it->second.session.is_handshake_complete()) {
-                session = &it->second.session;
-            } else {
-                auto anon_it = anon_sessions_.find(hdl);
-                if (anon_it != anon_sessions_.end() && anon_it->second.session.is_handshake_complete()) {
-                    session = &anon_it->second.session;
+            return async_request(hdl, payload, 0);
+        }
+
+        std::future<Payload> WsServerWrapper::async_request(WsConnectionHdl hdl,
+                                                            const Payload& payload,
+                                                            uint32_t timeout_ms) {
+            bool session_ready = false;
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                auto it = sessions_.find(hdl);
+                if (it != sessions_.end() && it->second.session.is_handshake_complete()) {
+                    session_ready = true;
+                } else {
+                    auto anon_it = anon_sessions_.find(hdl);
+                    if (anon_it != anon_sessions_.end() && anon_it->second.session.is_handshake_complete()) {
+                        session_ready = true;
+                    }
                 }
             }
-            if (!session) {
+            if (!session_ready) {
                 throw LogicError("Session not ready for sending requests.");
             }
 
@@ -171,21 +202,75 @@ namespace ObscuraProto {
             auto promise = std::promise<Payload>();
             auto future = promise.get_future();
 
+            uint32_t effective_timeout = resolve_request_timeout(timeout_ms);
+
+            // The promise is registered BEFORE send(): a response that races
+            // back immediately must find its pending record, otherwise it would
+            // be dropped as "unknown request". If send() then fails (e.g. the
+            // connection closed concurrently after the readiness check), the
+            // record is removed and the promise completed with the exception —
+            // no orphaned entry can leak (unlimited config) and the returned
+            // future resolves instead of hanging.
             {
                 std::lock_guard<std::mutex> lock(pending_requests_mutex_);
                 pending_requests_[hdl][request_id] = std::move(promise);
+                if (effective_timeout > 0) {
+                    request_deadlines_[hdl][request_id] =
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout);
+                }
             }
 
-            send(hdl, request_payload);
+            try {
+                send(hdl, request_payload);
+            } catch (...) {
+                std::exception_ptr eptr = std::current_exception();
+                {
+                    std::lock_guard<std::mutex> lock(pending_requests_mutex_);
+                    auto conn_it = pending_requests_.find(hdl);
+                    if (conn_it != pending_requests_.end()) {
+                        auto req_it = conn_it->second.find(request_id);
+                        if (req_it != conn_it->second.end()) {
+                            req_it->second.set_exception(eptr);
+                            conn_it->second.erase(req_it);
+                        }
+                        if (conn_it->second.empty()) {
+                            pending_requests_.erase(conn_it);
+                        }
+                    }
+                    auto dl_conn_it = request_deadlines_.find(hdl);
+                    if (dl_conn_it != request_deadlines_.end()) {
+                        dl_conn_it->second.erase(request_id);
+                        if (dl_conn_it->second.empty()) {
+                            request_deadlines_.erase(dl_conn_it);
+                        }
+                    }
+                }
+                std::rethrow_exception(eptr);
+            }
 
             return future;
         }
 
-        std::shared_ptr<Stream> WsServerWrapper::start_stream(WsConnectionHdl hdl) {
-            uint32_t stream_id = next_outgoing_stream_id_ * 2 + 1;
-            next_outgoing_stream_id_++;
+        uint32_t WsServerWrapper::resolve_request_timeout(uint32_t explicit_ms) const {
+            if (explicit_ms > 0) {
+                return explicit_ms;
+            }
+            if (config_.timeouts.enabled) {
+                return config_.timeouts.request_ms;
+            }
+            return 0;
+        }
 
-            auto stream = std::make_shared<Stream>(stream_id, [this, hdl](const Payload& p) { send(hdl, p); });
+        std::shared_ptr<Stream> WsServerWrapper::start_stream(WsConnectionHdl hdl) {
+            uint32_t stream_id = next_outgoing_stream_id_.fetch_add(1) * 2 + 1;
+
+            auto stream = std::make_shared<Stream>(
+                stream_id, [weak = std::weak_ptr<WsServerWrapper>(weak_from_this()), hdl](const Payload& p) {
+                    // Silent drop: the owner server is gone (destroyed wrapper).
+                    if (auto owner = weak.lock()) {
+                        owner->send(hdl, p);
+                    }
+                });
 
             {
                 std::lock_guard<std::mutex> lock(streams_mutex_);
@@ -201,11 +286,17 @@ namespace ObscuraProto {
         }
 
         std::shared_ptr<Stream> WsServerWrapper::start_stream(WsConnectionHdl hdl, Payload::OpCode stream_op_code) {
-            uint32_t stream_id = next_outgoing_stream_id_ * 2 + 1;
-            next_outgoing_stream_id_++;
+            uint32_t stream_id = next_outgoing_stream_id_.fetch_add(1) * 2 + 1;
 
-            auto stream =
-                std::make_shared<Stream>(stream_id, [this, hdl](const Payload& p) { send(hdl, p); }, stream_op_code);
+            auto stream = std::make_shared<Stream>(
+                stream_id,
+                [weak = std::weak_ptr<WsServerWrapper>(weak_from_this()), hdl](const Payload& p) {
+                    // Silent drop: the owner server is gone (destroyed wrapper).
+                    if (auto owner = weak.lock()) {
+                        owner->send(hdl, p);
+                    }
+                },
+                stream_op_code);
 
             {
                 std::lock_guard<std::mutex> lock(streams_mutex_);
@@ -213,9 +304,23 @@ namespace ObscuraProto {
             }
 
             const auto& oc = config_.opcodes;
-            auto it = sessions_.find(hdl);
-            if (it != sessions_.end()) {
-                auto version = it->second.session.get_selected_version();
+            bool found = false;
+            std::optional<Version> version;
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                auto it = sessions_.find(hdl);
+                if (it != sessions_.end()) {
+                    found = true;
+                    version = it->second.session.get_selected_version();
+                } else {
+                    auto anon_it = anon_sessions_.find(hdl);
+                    if (anon_it != anon_sessions_.end()) {
+                        found = true;
+                        version = anon_it->second.session.get_selected_version();
+                    }
+                }
+            }
+            if (found) {
                 PayloadBuilder builder(oc.STREAM_START);
                 builder.add_param(stream_id);
                 if (version.has_value() && version.value() >= Versions::V1_1) {
@@ -223,18 +328,7 @@ namespace ObscuraProto {
                 }
                 send(hdl, builder.build());
             } else {
-                auto anon_it = anon_sessions_.find(hdl);
-                if (anon_it != anon_sessions_.end()) {
-                    auto version = anon_it->second.session.get_selected_version();
-                    PayloadBuilder builder(oc.STREAM_START);
-                    builder.add_param(stream_id);
-                    if (version.has_value() && version.value() >= Versions::V1_1) {
-                        builder.add_param(static_cast<uint16_t>(stream_op_code));
-                    }
-                    send(hdl, builder.build());
-                } else {
-                    throw LogicError("Session not found for this connection.");
-                }
+                throw LogicError("Session not found for this connection.");
             }
 
             return stream;
@@ -321,21 +415,32 @@ namespace ObscuraProto {
         }
 
         void WsServerWrapper::on_close(WsConnectionHdl hdl) {
-            // Notify the callback before cleanup (hdl is still valid)
+            // Notify the callback before cleanup (hdl is still valid).
+            // User callback: no sessions_mutex_ held here.
             if (on_close_callback_) {
                 on_close_callback_(hdl);
             }
 
-            auto auth_it = sessions_.find(hdl);
-            if (auth_it != sessions_.end()) {
-                rate_limiter_.unregister_connection(auth_it->second.rate_limiter_id, auth_it->second.remote_ip);
-                sessions_.erase(auth_it);
+            // Lock order: sessions_mutex_ -> streams_mutex_ -> identity_map_mutex_,
+            // then the leaf mutexes (pending_requests_mutex_, handshake_time_mutex_).
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
+                auto auth_it = sessions_.find(hdl);
+                if (auth_it != sessions_.end()) {
+                    rate_limiter_.unregister_connection(auth_it->second.rate_limiter_id, auth_it->second.remote_ip);
+                    sessions_.erase(auth_it);
+                }
+
+                auto anon_it = anon_sessions_.find(hdl);
+                if (anon_it != anon_sessions_.end()) {
+                    rate_limiter_.unregister_connection(anon_it->second.rate_limiter_id, anon_it->second.remote_ip);
+                    anon_sessions_.erase(anon_it);
+                }
             }
 
-            auto anon_it = anon_sessions_.find(hdl);
-            if (anon_it != anon_sessions_.end()) {
-                rate_limiter_.unregister_connection(anon_it->second.rate_limiter_id, anon_it->second.remote_ip);
-                anon_sessions_.erase(anon_it);
+            {
+                std::lock_guard<std::mutex> lock(streams_mutex_);
+                per_connection_streams_.erase(hdl);
             }
 
             {
@@ -348,11 +453,6 @@ namespace ObscuraProto {
             }
 
             {
-                std::lock_guard<std::mutex> lock(streams_mutex_);
-                per_connection_streams_.erase(hdl);
-            }
-
-            {
                 std::lock_guard<std::mutex> lock(pending_requests_mutex_);
                 auto conn_it = pending_requests_.find(hdl);
                 if (conn_it != pending_requests_.end()) {
@@ -361,6 +461,7 @@ namespace ObscuraProto {
                     }
                     pending_requests_.erase(conn_it);
                 }
+                request_deadlines_.erase(hdl);
             }
 
             {
@@ -372,7 +473,7 @@ namespace ObscuraProto {
         // --- Timeout checking ---
 
         void WsServerWrapper::schedule_timeout_check() {
-            if (stopping_ || !config_.timeouts.enabled) {
+            if (stopping_) {
                 return;
             }
             uint32_t interval = config_.timeouts.check_interval_ms;
@@ -393,22 +494,26 @@ namespace ObscuraProto {
 
             // Idle timeout check
             if (config_.timeouts.idle_ms > 0) {
-                for (auto& [hdl, state] : sessions_) {
-                    if (state.last_activity_ms > 0 &&
-                        (now - state.last_activity_ms) > static_cast<int64_t>(config_.timeouts.idle_ms)) {
-                        try {
-                            server_.close(hdl, websocketpp::close::status::policy_violation, "Idle timeout");
-                        } catch (...) {
+                std::vector<WsConnectionHdl> idle_connections;
+                {
+                    std::lock_guard<std::mutex> lock(sessions_mutex_);
+                    for (auto& [hdl, state] : sessions_) {
+                        if (state.last_activity_ms > 0 &&
+                            (now - state.last_activity_ms) > static_cast<int64_t>(config_.timeouts.idle_ms)) {
+                            idle_connections.push_back(hdl);
+                        }
+                    }
+                    for (auto& [hdl, state] : anon_sessions_) {
+                        if (state.last_activity_ms > 0 &&
+                            (now - state.last_activity_ms) > static_cast<int64_t>(config_.timeouts.idle_ms)) {
+                            idle_connections.push_back(hdl);
                         }
                     }
                 }
-                for (auto& [hdl, state] : anon_sessions_) {
-                    if (state.last_activity_ms > 0 &&
-                        (now - state.last_activity_ms) > static_cast<int64_t>(config_.timeouts.idle_ms)) {
-                        try {
-                            server_.close(hdl, websocketpp::close::status::policy_violation, "Idle timeout");
-                        } catch (...) {
-                        }
+                for (auto& hdl : idle_connections) {
+                    try {
+                        server_.close(hdl, websocketpp::close::status::policy_violation, "Idle timeout");
+                    } catch (...) {
                     }
                 }
             }
@@ -431,6 +536,39 @@ namespace ObscuraProto {
                 }
             }
 
+            // Request timeout check: expire every request whose deadline has passed.
+            // The record is removed atomically with the promise completion, so a late
+            // response handler finds no entry and ignores the response —
+            // std::promise::set_* is never called twice.
+            if (!request_deadlines_.empty()) {
+                auto now = clock::now();
+                std::exception_ptr eptr = std::make_exception_ptr(TimeoutError("Request timed out"));
+                std::lock_guard<std::mutex> lock(pending_requests_mutex_);
+                for (auto conn_it = request_deadlines_.begin(); conn_it != request_deadlines_.end();) {
+                    auto& per_conn = conn_it->second;
+                    for (auto it = per_conn.begin(); it != per_conn.end();) {
+                        if (it->second <= now) {
+                            auto pit = pending_requests_.find(conn_it->first);
+                            if (pit != pending_requests_.end()) {
+                                auto req_it = pit->second.find(it->first);
+                                if (req_it != pit->second.end()) {
+                                    req_it->second.set_exception(eptr);
+                                    pit->second.erase(req_it);
+                                }
+                            }
+                            it = per_conn.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
+                    if (per_conn.empty()) {
+                        conn_it = request_deadlines_.erase(conn_it);
+                    } else {
+                        ++conn_it;
+                    }
+                }
+            }
+
             // Clean up rate limiter stale entries
             rate_limiter_.cleanup();
         }
@@ -438,6 +576,8 @@ namespace ObscuraProto {
         // --- Anonymous Session Methods ---
 
         void WsServerWrapper::send_anonymous(WsConnectionHdl hdl, const Payload& payload) {
+            // Same critical-section policy as send(): lookup + encrypt + transmit.
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
             auto it = anon_sessions_.find(hdl);
             if (it == anon_sessions_.end() || !it->second.session.is_handshake_complete()) {
                 throw LogicError("Anonymous session not ready for sending data.");
@@ -473,6 +613,7 @@ namespace ObscuraProto {
         }
 
         PublicKey WsServerWrapper::get_client_identity(WsConnectionHdl hdl) {
+            std::lock_guard<std::mutex> lock(sessions_mutex_);
             auto it = sessions_.find(hdl);
             if (it == sessions_.end()) {
                 throw LogicError("Session not found for this connection.");
@@ -485,22 +626,33 @@ namespace ObscuraProto {
         }
 
         void WsServerWrapper::send_to_identity(const PublicKey& identity_pk, const Payload& payload) {
-            std::lock_guard<std::mutex> lock(identity_map_mutex_);
-            auto it = identity_to_hdl_.find(identity_pk);
-            if (it == identity_to_hdl_.end()) {
-                throw LogicError("Identity is not connected.");
+            // The identity lock is released before send() so the lock order stays
+            // sessions_mutex_ -> ... -> identity_map_mutex_ (send takes sessions_mutex_
+            // without holding the identity lock).
+            WsConnectionHdl hdl;
+            {
+                std::lock_guard<std::mutex> lock(identity_map_mutex_);
+                auto it = identity_to_hdl_.find(identity_pk);
+                if (it == identity_to_hdl_.end()) {
+                    throw LogicError("Identity is not connected.");
+                }
+                hdl = it->second;
             }
-            send(it->second, payload);
+            send(hdl, payload);
         }
 
         std::future<Payload> WsServerWrapper::async_request_to_identity(const PublicKey& identity_pk,
                                                                         const Payload& payload) {
-            std::lock_guard<std::mutex> lock(identity_map_mutex_);
-            auto it = identity_to_hdl_.find(identity_pk);
-            if (it == identity_to_hdl_.end()) {
-                throw LogicError("Identity is not connected.");
+            WsConnectionHdl hdl;
+            {
+                std::lock_guard<std::mutex> lock(identity_map_mutex_);
+                auto it = identity_to_hdl_.find(identity_pk);
+                if (it == identity_to_hdl_.end()) {
+                    throw LogicError("Identity is not connected.");
+                }
+                hdl = it->second;
             }
-            return async_request(it->second, payload);
+            return async_request(hdl, payload);
         }
 
         Payload WsServerWrapper::sync_request_to_identity(const PublicKey& identity_pk, const Payload& payload) {
@@ -561,46 +713,121 @@ namespace ObscuraProto {
 
             const auto& oc = config_.opcodes;
 
-            // Check if this is an existing authenticated session
-            auto auth_it = sessions_.find(hdl);
-            if (auth_it != sessions_.end()) {
-                Session& session = auth_it->second.session;
-                if (!session.is_handshake_complete()) {
-                    return;
-                }
+            // --- Existing authenticated or anonymous session ---
+            // Session lookup + decryption happen under sessions_mutex_; user callbacks
+            // (payload/request/stream handlers) are always invoked after it is released.
+            std::optional<Payload> decrypted;
+            bool is_known = false;
+            bool is_auth = false;
+            {
+                std::lock_guard<std::mutex> lock(sessions_mutex_);
 
-                // Rate limiting: check message rate per connection
-                if (config_.rate_limit.enabled && !rate_limiter_.check_message_rate(auth_it->second.rate_limiter_id)) {
-                    server_.close(hdl, websocketpp::close::status::policy_violation, "Message rate limit exceeded");
-                    return;
-                }
-
-                try {
-                    byte_vector packet(msg->get_payload().begin(), msg->get_payload().end());
-
-                    // Payload size limit check (before decryption — encrypted size)
-                    if (config_.message_limits.enabled && config_.message_limits.max_decrypted_payload > 0) {
-                        // Rough estimate: encrypted payload shouldn't be much larger than decrypted
-                        // We check decrypted size after decryption below
+                // Check if this is an existing authenticated session
+                auto auth_it = sessions_.find(hdl);
+                if (auth_it != sessions_.end()) {
+                    is_known = true;
+                    is_auth = true;
+                    Session& session = auth_it->second.session;
+                    if (!session.is_handshake_complete()) {
+                        return;
                     }
 
-                    Payload payload = session.decrypt_packet(packet);
+                    // Rate limiting: check message rate per connection
+                    if (config_.rate_limit.enabled &&
+                        !rate_limiter_.check_message_rate(auth_it->second.rate_limiter_id)) {
+                        server_.close(hdl, websocketpp::close::status::policy_violation, "Message rate limit exceeded");
+                        return;
+                    }
 
-                    // Payload size limit check (decrypted)
-                    if (config_.message_limits.enabled && config_.message_limits.max_decrypted_payload > 0) {
-                        if (payload.parameters.size() > config_.message_limits.max_decrypted_payload) {
-                            server_.close(hdl, websocketpp::close::status::policy_violation, "Payload too large");
+                    try {
+                        byte_vector packet(msg->get_payload().begin(), msg->get_payload().end());
+
+                        // Payload size limit check (before decryption — encrypted size)
+                        if (config_.message_limits.enabled && config_.message_limits.max_decrypted_payload > 0) {
+                            // Rough estimate: encrypted payload shouldn't be much larger than decrypted
+                            // We check decrypted size after decryption below
+                        }
+
+                        Payload payload = session.decrypt_packet(packet);
+
+                        // Payload size limit check (decrypted)
+                        if (config_.message_limits.enabled && config_.message_limits.max_decrypted_payload > 0) {
+                            if (payload.parameters.size() > config_.message_limits.max_decrypted_payload) {
+                                server_.close(hdl, websocketpp::close::status::policy_violation, "Payload too large");
+                                return;
+                            }
+                        }
+
+                        // Record message for rate limiter
+                        if (config_.rate_limit.enabled) {
+                            rate_limiter_.record_message(auth_it->second.rate_limiter_id);
+                        }
+
+                        // Update last activity for idle timeout
+                        auth_it->second.last_activity_ms = now_ms();
+
+                        decrypted = std::move(payload);
+                    } catch (const std::exception& e) {
+                        std::cerr << "Decryption failed for authenticated session: " << e.what() << std::endl;
+                        return;
+                    }
+                } else {
+                    // Check if this is an existing anonymous session
+                    auto anon_it = anon_sessions_.find(hdl);
+                    if (anon_it != anon_sessions_.end()) {
+                        is_known = true;
+                        is_auth = false;
+                        Session& session = anon_it->second.session;
+                        if (!session.is_handshake_complete()) {
+                            return;
+                        }
+
+                        // Rate limiting: check message rate per connection
+                        if (config_.rate_limit.enabled &&
+                            !rate_limiter_.check_message_rate(anon_it->second.rate_limiter_id)) {
+                            server_.close(
+                                hdl, websocketpp::close::status::policy_violation, "Message rate limit exceeded");
+                            return;
+                        }
+
+                        try {
+                            byte_vector packet(msg->get_payload().begin(), msg->get_payload().end());
+                            Payload payload = session.decrypt_packet(packet);
+
+                            // Payload size limit check (decrypted)
+                            if (config_.message_limits.enabled && config_.message_limits.max_decrypted_payload > 0) {
+                                if (payload.parameters.size() > config_.message_limits.max_decrypted_payload) {
+                                    server_.close(
+                                        hdl, websocketpp::close::status::policy_violation, "Payload too large");
+                                    return;
+                                }
+                            }
+
+                            // Record message for rate limiter
+                            if (config_.rate_limit.enabled) {
+                                rate_limiter_.record_message(anon_it->second.rate_limiter_id);
+                            }
+
+                            // Update last activity
+                            anon_it->second.last_activity_ms = now_ms();
+
+                            decrypted = std::move(payload);
+                        } catch (const std::exception& e) {
+                            std::cerr << "Decryption failed for anonymous session: " << e.what() << std::endl;
                             return;
                         }
                     }
+                }
+            }
 
-                    // Record message for rate limiter
-                    if (config_.rate_limit.enabled) {
-                        rate_limiter_.record_message(auth_it->second.rate_limiter_id);
-                    }
-
-                    // Update last activity for idle timeout
-                    auth_it->second.last_activity_ms = now_ms();
+            if (is_known) {
+                // User callbacks (payload/request/stream handlers, stream data/
+                // end/cancel dispatch) may throw. Swallow the exception so it
+                // cannot kill the websocket io thread: the server stays alive
+                // for the remaining connections. Symmetric to the client's
+                // on_message handler.
+                try {
+                    Payload payload = std::move(*decrypted);
 
                     if (payload.op_code == oc.RESPONSE) {
                         PayloadReader reader(payload);
@@ -635,147 +862,28 @@ namespace ObscuraProto {
                                 stream_op_code = reader.read_param<uint16_t>();
                             }
 
-                            auto stream = std::make_shared<Stream>(
-                                stream_id, [this, hdl](const Payload& p) { send(hdl, p); }, stream_op_code);
-                            {
-                                std::lock_guard<std::mutex> lock(streams_mutex_);
-                                per_connection_streams_[hdl][stream_id] = stream;
-                            }
-
-                            bool handled = false;
-                            std::function<void(std::shared_ptr<Stream>)> stream_handler;
-                            if (stream_op_code.has_value()) {
-                                std::lock_guard<std::mutex> lock(stream_handlers_mutex_);
-                                auto it = stream_handlers_.find(*stream_op_code);
-                                if (it != stream_handlers_.end()) {
-                                    stream_handler = it->second;
-                                    handled = true;
-                                }
-                            }
-                            if (stream_handler) {
-                                stream_handler(std::move(stream));
-                            } else if (!handled && incoming_stream_handler_) {
-                                incoming_stream_handler_(std::move(stream));
-                            }
-                        } else if (payload.op_code == oc.STREAM_DATA) {
-                            byte_vector data = reader.read_param<byte_vector>();
-                            std::lock_guard<std::mutex> lock(streams_mutex_);
-                            auto conn_it = per_connection_streams_.find(hdl);
-                            if (conn_it != per_connection_streams_.end()) {
-                                auto str_it = conn_it->second.find(stream_id);
-                                if (str_it != conn_it->second.end()) {
-                                    str_it->second->dispatch_data(std::move(data));
-                                }
-                            }
-                        } else if (payload.op_code == oc.STREAM_END) {
-                            std::lock_guard<std::mutex> lock(streams_mutex_);
-                            auto conn_it = per_connection_streams_.find(hdl);
-                            if (conn_it != per_connection_streams_.end()) {
-                                auto str_it = conn_it->second.find(stream_id);
-                                if (str_it != conn_it->second.end()) {
-                                    str_it->second->dispatch_end();
-                                }
-                            }
-                        } else if (payload.op_code == oc.STREAM_CANCEL) {
-                            std::lock_guard<std::mutex> lock(streams_mutex_);
-                            auto conn_it = per_connection_streams_.find(hdl);
-                            if (conn_it != per_connection_streams_.end()) {
-                                auto str_it = conn_it->second.find(stream_id);
-                                if (str_it != conn_it->second.end()) {
-                                    str_it->second->dispatch_cancel();
-                                    conn_it->second.erase(str_it);
-                                }
-                            }
-                        }
-
-                    } else {
-                        dispatch_payload(
-                            hdl,
-                            payload,
-                            *this,
-                            request_handlers_,
-                            op_code_handlers_,
-                            default_payload_handler_,
-                            op_handlers_mutex_,
-                            [this](WsConnectionHdl h, uint32_t rid, const Payload& p) { send_response(h, rid, p); });
-                    }
-
-                } catch (const std::exception& e) {
-                    std::cerr << "Decryption failed for authenticated session: " << e.what() << std::endl;
-                }
-                return;
-            }
-
-            // Check if this is an existing anonymous session
-            auto anon_it = anon_sessions_.find(hdl);
-            if (anon_it != anon_sessions_.end()) {
-                Session& session = anon_it->second.session;
-                if (!session.is_handshake_complete()) {
-                    return;
-                }
-
-                // Rate limiting: check message rate per connection
-                if (config_.rate_limit.enabled && !rate_limiter_.check_message_rate(anon_it->second.rate_limiter_id)) {
-                    server_.close(hdl, websocketpp::close::status::policy_violation, "Message rate limit exceeded");
-                    return;
-                }
-
-                try {
-                    byte_vector packet(msg->get_payload().begin(), msg->get_payload().end());
-                    Payload payload = session.decrypt_packet(packet);
-
-                    // Payload size limit check (decrypted)
-                    if (config_.message_limits.enabled && config_.message_limits.max_decrypted_payload > 0) {
-                        if (payload.parameters.size() > config_.message_limits.max_decrypted_payload) {
-                            server_.close(hdl, websocketpp::close::status::policy_violation, "Payload too large");
-                            return;
-                        }
-                    }
-
-                    // Record message for rate limiter
-                    if (config_.rate_limit.enabled) {
-                        rate_limiter_.record_message(anon_it->second.rate_limiter_id);
-                    }
-
-                    // Update last activity
-                    anon_it->second.last_activity_ms = now_ms();
-
-                    if (payload.op_code == oc.RESPONSE) {
-                        PayloadReader reader(payload);
-                        uint32_t request_id = reader.read_param<uint32_t>();
-                        byte_vector response_bytes = reader.read_param<byte_vector>();
-                        Payload response_payload = Payload::deserialize(response_bytes);
-
-                        {
-                            std::lock_guard<std::mutex> lock(pending_requests_mutex_);
-                            auto conn_it = pending_requests_.find(hdl);
-                            if (conn_it != pending_requests_.end()) {
-                                auto req_it = conn_it->second.find(request_id);
-                                if (req_it != conn_it->second.end()) {
-                                    req_it->second.set_value(std::move(response_payload));
-                                    conn_it->second.erase(req_it);
-                                } else {
-                                    std::cerr
-                                        << "[SERVER] Received anonymous response for unknown request ID: " << request_id
-                                        << std::endl;
-                                }
+                            std::shared_ptr<Stream> stream;
+                            if (is_auth) {
+                                stream = std::make_shared<Stream>(
+                                    stream_id,
+                                    [weak = std::weak_ptr<WsServerWrapper>(weak_from_this()), hdl](const Payload& p) {
+                                        // Silent drop: the owner server is gone (destroyed wrapper).
+                                        if (auto owner = weak.lock()) {
+                                            owner->send(hdl, p);
+                                        }
+                                    },
+                                    stream_op_code);
                             } else {
-                                std::cerr << "[SERVER] Received anonymous response for unknown connection" << std::endl;
+                                stream = std::make_shared<Stream>(
+                                    stream_id,
+                                    [weak = std::weak_ptr<WsServerWrapper>(weak_from_this()), hdl](const Payload& p) {
+                                        // Silent drop: the owner server is gone (destroyed wrapper).
+                                        if (auto owner = weak.lock()) {
+                                            owner->send_anonymous(hdl, p);
+                                        }
+                                    },
+                                    stream_op_code);
                             }
-                        }
-                    } else if (payload.op_code == oc.STREAM_START || payload.op_code == oc.STREAM_DATA ||
-                               payload.op_code == oc.STREAM_END || payload.op_code == oc.STREAM_CANCEL) {
-                        PayloadReader reader(payload);
-                        uint32_t stream_id = reader.read_param<uint32_t>();
-
-                        if (payload.op_code == oc.STREAM_START) {
-                            std::optional<Payload::OpCode> stream_op_code = std::nullopt;
-                            if (reader.has_more()) {
-                                stream_op_code = reader.read_param<uint16_t>();
-                            }
-
-                            auto stream = std::make_shared<Stream>(
-                                stream_id, [this, hdl](const Payload& p) { send_anonymous(hdl, p); }, stream_op_code);
                             {
                                 std::lock_guard<std::mutex> lock(streams_mutex_);
                                 per_connection_streams_[hdl][stream_id] = stream;
@@ -784,11 +892,20 @@ namespace ObscuraProto {
                             bool handled = false;
                             std::function<void(std::shared_ptr<Stream>)> stream_handler;
                             if (stream_op_code.has_value()) {
-                                std::lock_guard<std::mutex> lock(anon_stream_handlers_mutex_);
-                                auto it = anon_stream_handlers_.find(*stream_op_code);
-                                if (it != anon_stream_handlers_.end()) {
-                                    stream_handler = it->second;
-                                    handled = true;
+                                if (is_auth) {
+                                    std::lock_guard<std::mutex> lock(stream_handlers_mutex_);
+                                    auto it = stream_handlers_.find(*stream_op_code);
+                                    if (it != stream_handlers_.end()) {
+                                        stream_handler = it->second;
+                                        handled = true;
+                                    }
+                                } else {
+                                    std::lock_guard<std::mutex> lock(anon_stream_handlers_mutex_);
+                                    auto it = anon_stream_handlers_.find(*stream_op_code);
+                                    if (it != anon_stream_handlers_.end()) {
+                                        stream_handler = it->second;
+                                        handled = true;
+                                    }
                                 }
                             }
                             if (stream_handler) {
@@ -798,54 +915,84 @@ namespace ObscuraProto {
                             }
                         } else if (payload.op_code == oc.STREAM_DATA) {
                             byte_vector data = reader.read_param<byte_vector>();
-                            std::lock_guard<std::mutex> lock(streams_mutex_);
-                            auto conn_it = per_connection_streams_.find(hdl);
-                            if (conn_it != per_connection_streams_.end()) {
-                                auto str_it = conn_it->second.find(stream_id);
-                                if (str_it != conn_it->second.end()) {
-                                    str_it->second->dispatch_data(std::move(data));
+                            std::shared_ptr<Stream> stream;
+                            {
+                                std::lock_guard<std::mutex> lock(streams_mutex_);
+                                auto conn_it = per_connection_streams_.find(hdl);
+                                if (conn_it != per_connection_streams_.end()) {
+                                    auto str_it = conn_it->second.find(stream_id);
+                                    if (str_it != conn_it->second.end()) {
+                                        stream = str_it->second;
+                                    }
                                 }
+                            }
+                            // Dispatch outside streams_mutex_: user handlers may call send().
+                            if (stream) {
+                                stream->dispatch_data(std::move(data));
                             }
                         } else if (payload.op_code == oc.STREAM_END) {
-                            std::lock_guard<std::mutex> lock(streams_mutex_);
-                            auto conn_it = per_connection_streams_.find(hdl);
-                            if (conn_it != per_connection_streams_.end()) {
-                                auto str_it = conn_it->second.find(stream_id);
-                                if (str_it != conn_it->second.end()) {
-                                    str_it->second->dispatch_end();
+                            std::shared_ptr<Stream> stream;
+                            {
+                                std::lock_guard<std::mutex> lock(streams_mutex_);
+                                auto conn_it = per_connection_streams_.find(hdl);
+                                if (conn_it != per_connection_streams_.end()) {
+                                    auto str_it = conn_it->second.find(stream_id);
+                                    if (str_it != conn_it->second.end()) {
+                                        stream = str_it->second;
+                                    }
                                 }
+                            }
+                            if (stream) {
+                                stream->dispatch_end();
                             }
                         } else if (payload.op_code == oc.STREAM_CANCEL) {
-                            std::lock_guard<std::mutex> lock(streams_mutex_);
-                            auto conn_it = per_connection_streams_.find(hdl);
-                            if (conn_it != per_connection_streams_.end()) {
-                                auto str_it = conn_it->second.find(stream_id);
-                                if (str_it != conn_it->second.end()) {
-                                    str_it->second->dispatch_cancel();
-                                    conn_it->second.erase(str_it);
+                            std::shared_ptr<Stream> stream;
+                            {
+                                std::lock_guard<std::mutex> lock(streams_mutex_);
+                                auto conn_it = per_connection_streams_.find(hdl);
+                                if (conn_it != per_connection_streams_.end()) {
+                                    auto str_it = conn_it->second.find(stream_id);
+                                    if (str_it != conn_it->second.end()) {
+                                        stream = str_it->second;
+                                        conn_it->second.erase(str_it);
+                                    }
                                 }
                             }
+                            if (stream) {
+                                stream->dispatch_cancel();
+                            }
                         }
-
                     } else {
-                        dispatch_payload(hdl,
-                                         payload,
-                                         *this,
-                                         anon_request_handlers_,
-                                         anon_op_code_handlers_,
-                                         anon_default_payload_handler_,
-                                         anon_op_handlers_mutex_,
-                                         [this](WsConnectionHdl h, uint32_t rid, const Payload& p) {
-                                             const auto& oc = config_.opcodes;
-                                             PayloadBuilder response_builder(oc.RESPONSE);
-                                             response_builder.add_param(rid);
-                                             response_builder.add_param(p.serialize());
-                                             send_anonymous(h, response_builder.build());
-                                         });
+                        if (is_auth) {
+                            dispatch_payload(hdl,
+                                             payload,
+                                             *this,
+                                             request_handlers_,
+                                             op_code_handlers_,
+                                             default_payload_handler_,
+                                             op_handlers_mutex_,
+                                             [this](WsConnectionHdl h, uint32_t rid, const Payload& p) {
+                                                 send_response(h, rid, p);
+                                             });
+                        } else {
+                            dispatch_payload(hdl,
+                                             payload,
+                                             *this,
+                                             anon_request_handlers_,
+                                             anon_op_code_handlers_,
+                                             anon_default_payload_handler_,
+                                             anon_op_handlers_mutex_,
+                                             [this](WsConnectionHdl h, uint32_t rid, const Payload& p) {
+                                                 const auto& oc = config_.opcodes;
+                                                 PayloadBuilder response_builder(oc.RESPONSE);
+                                                 response_builder.add_param(rid);
+                                                 response_builder.add_param(p.serialize());
+                                                 send_anonymous(h, response_builder.build());
+                                             });
+                        }
                     }
-
                 } catch (const std::exception& e) {
-                    std::cerr << "Decryption failed for anonymous session: " << e.what() << std::endl;
+                    std::cerr << "[SERVER] Message processing failed: " << e.what() << std::endl;
                 }
                 return;
             }
@@ -877,6 +1024,8 @@ namespace ObscuraProto {
                 if (is_identified && temp_session.has_peer_identity()) {
                     PublicKey client_pk = *temp_session.get_peer_identity();
 
+                    // The identity handler is a user callback: invoke it without holding
+                    // sessions_mutex_.
                     bool accepted = true;
                     if (client_identity_handler_) {
                         accepted = client_identity_handler_(hdl, client_pk);
@@ -884,8 +1033,11 @@ namespace ObscuraProto {
 
                     if (accepted) {
                         uint64_t conn_id = rate_limiter_.register_connection(ip);
-                        auto emplace_result =
+                        {
+                            std::lock_guard<std::mutex> lock(sessions_mutex_);
                             sessions_.emplace(hdl, ConnectionState(std::move(temp_session), conn_id, ip, now_ms()));
+                        }
+                        // Lock order: sessions_mutex_ before identity_map_mutex_.
                         {
                             std::lock_guard<std::mutex> lock(identity_map_mutex_);
                             identity_to_hdl_[client_pk] = hdl;
@@ -896,7 +1048,10 @@ namespace ObscuraProto {
                     }
                 } else {
                     uint64_t conn_id = rate_limiter_.register_connection(ip);
-                    anon_sessions_.emplace(hdl, ConnectionState(std::move(temp_session), conn_id, ip, now_ms()));
+                    {
+                        std::lock_guard<std::mutex> lock(sessions_mutex_);
+                        anon_sessions_.emplace(hdl, ConnectionState(std::move(temp_session), conn_id, ip, now_ms()));
+                    }
                 }
 
                 // Clear handshake timeout tracking since handshake completed
@@ -912,9 +1067,21 @@ namespace ObscuraProto {
         }
 
         Payload WsServerWrapper::sync_request(WsConnectionHdl hdl, const Payload& payload) {
-            auto future_result = this->async_request(hdl, payload);
-            Payload result = future_result.get();
-            return result;
+            return sync_request(hdl, payload, 0);
+        }
+
+        Payload WsServerWrapper::sync_request(WsConnectionHdl hdl, const Payload& payload, uint32_t timeout_ms) {
+            auto future_result = this->async_request(hdl, payload, timeout_ms);
+            uint32_t effective_timeout = resolve_request_timeout(timeout_ms);
+            if (effective_timeout == 0) {
+                return future_result.get();
+            }
+            if (future_result.wait_for(std::chrono::milliseconds(effective_timeout)) == std::future_status::timeout) {
+                // The periodic timer completes the promise with TimeoutError shortly
+                // afterwards; throwing here unblocks the caller immediately.
+                throw TimeoutError("Request timed out");
+            }
+            return future_result.get();
         }
 
     }  // namespace net

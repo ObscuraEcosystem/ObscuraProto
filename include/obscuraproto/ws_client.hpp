@@ -2,6 +2,8 @@
 #define OBSCURAPROTO_WS_CLIENT_HPP
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <future>
 #include <map>
@@ -16,7 +18,7 @@
 namespace ObscuraProto {
     namespace net {
 
-        class WsClientWrapper {
+        class WsClientWrapper : public std::enable_shared_from_this<WsClientWrapper> {
         public:
             using OnReadyCallback = std::function<void()>;
             using OnPayloadCallback = std::function<void(Payload)>;
@@ -34,21 +36,64 @@ namespace ObscuraProto {
 
             void connect(const std::string& uri);
             void disconnect();
+            /**
+             * @brief Sends a payload without waiting for a response.
+             * @param payload The payload to send.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending.
+             *
+             * Transport-level send failures are logged and swallowed (no exception
+             * escapes this call beyond the LogicError above).
+             */
             void send(const Payload& payload);
 
             /**
              * @brief Sends a payload and returns a future for the response.
              * @param payload The payload to send. The op_code should indicate a request.
              * @return A future that will contain the response payload.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending requests.
+             *
+             * The default timeout (config_.timeouts.request_ms) applies; a 0 value in
+             * the config disables the deadline (unlimited). On timeout the future
+             * resolves with ObscuraProto::TimeoutError.
              */
             std::future<Payload> async_request(const Payload& payload);
+
+            /**
+             * @brief Sends a payload and returns a future for the response, bounded by a timeout.
+             * @param payload The payload to send. The op_code should indicate a request.
+             * @param timeout_ms Maximum time to wait for the response in milliseconds
+             *                   (0 = use the default from config_.timeouts.request_ms;
+             *                   a 0 value in the config disables the deadline = unlimited).
+             * @return A future that will contain the response payload.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending requests.
+             *
+             * On timeout the future resolves with ObscuraProto::TimeoutError.
+             */
+            std::future<Payload> async_request(const Payload& payload, uint32_t timeout_ms);
 
             /**
              * @brief Sends a payload and returns a response.
              * @param payload The payload to send. The op_code should indicate a request.
              * @return A response payload.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending requests.
+             * @throws ObscuraProto::TimeoutError if the default timeout (config_.timeouts.request_ms,
+             *         where a 0 value disables the deadline) expires before the response arrives.
+             * @throws ObscuraProto::RuntimeError if the client disconnects while waiting.
              */
             Payload sync_request(const Payload& payload);
+
+            /**
+             * @brief Sends a payload and returns a response, bounded by a timeout.
+             * @param payload The payload to send. The op_code should indicate a request.
+             * @param timeout_ms Maximum time to wait for the response in milliseconds
+             *                   (0 = use the default from config_.timeouts.request_ms;
+             *                   a 0 value in the config disables the deadline = unlimited).
+             * @return A response payload.
+             * @throws ObscuraProto::LogicError if the session is not ready for sending requests.
+             * @throws ObscuraProto::TimeoutError if the timeout expires before the response arrives.
+             * @throws ObscuraProto::RuntimeError if the client disconnects while waiting.
+             */
+            Payload sync_request(const Payload& payload, uint32_t timeout_ms);
 
             /**
              * @brief Sends a response to a specific server-initiated request.
@@ -120,13 +165,25 @@ namespace ObscuraProto {
             void on_message(WsConnectionHdl hdl, WsClientMessagePtr msg);
             void run_client();
 
+            // --- Request timeout handling ---
+            // A single watchdog thread wakes at the earliest pending deadline and
+            // completes the expired promise with TimeoutError. The deadlines map and
+            // pending_requests_ are both guarded by pending_requests_mutex_; the cv
+            // is notified on insert (earlier deadline) and on shutdown.
+            uint32_t resolve_request_timeout(uint32_t explicit_ms) const;
+            void ensure_watchdog();
+            void stop_watchdog();
+            void watchdog_loop();
+
             WsClient client_;
             Config config_;
             std::unique_ptr<Session> session_;
             std::optional<KeyPair> client_identity_kp_;
             WsConnectionHdl connection_hdl_;
             std::unique_ptr<std::thread> client_thread_;
-            bool is_connected_ = false;
+            // Atomic so reads from the ws thread (on_open/on_close/on_fail) and from
+            // external threads (send/async_request/disconnect) are race-free.
+            std::atomic<bool> is_connected_{false};
 
             OnReadyCallback on_ready_callback_;
             OnDisconnectCallback on_disconnect_callback_;
@@ -142,11 +199,21 @@ namespace ObscuraProto {
             std::map<uint32_t, std::promise<Payload>> pending_requests_;
             std::atomic<uint32_t> next_request_id_{0};
 
+            // Request timeout watchdog (guarded by pending_requests_mutex_).
+            std::condition_variable timeout_cv_;
+            std::map<uint32_t, std::chrono::steady_clock::time_point> request_deadlines_;
+
+            // Watchdog thread lifecycle (guarded by watchdog_mutex_).
+            std::mutex watchdog_mutex_;
+            std::unique_ptr<std::thread> watchdog_thread_;
+            std::atomic<bool> watchdog_started_{false};
+            std::atomic<bool> watchdog_stop_{false};
+
             // For streaming
             std::mutex streams_mutex_;
             std::map<uint32_t, std::shared_ptr<Stream>> active_streams_;
             std::function<void(std::shared_ptr<Stream>)> incoming_stream_handler_;
-            uint32_t next_outgoing_stream_id_ = 0;
+            std::atomic<uint32_t> next_outgoing_stream_id_{0};
 
             // For op_code-routed streams
             std::mutex stream_handlers_mutex_;

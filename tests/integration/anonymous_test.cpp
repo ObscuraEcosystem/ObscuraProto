@@ -173,20 +173,20 @@ TEST_F(AnonymousIntegrationTest, AnonymousStreaming) {
     server.run(port);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
+    auto client = std::make_shared<ObscuraProto::net::WsClientWrapper>(client_view_of_server_key);
     std::promise<void> client_ready;
-    client.set_on_ready_callback([&]() { client_ready.set_value(); });
-    client.connect("ws://localhost:" + std::to_string(port));
+    client->set_on_ready_callback([&]() { client_ready.set_value(); });
+    client->connect("ws://localhost:" + std::to_string(port));
     EXPECT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
 
-    auto client_stream = client.start_stream(OP_ECHO);
+    auto client_stream = client->start_stream(OP_ECHO);
     EXPECT_EQ(server_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
 
     client_stream->write(
         ObscuraProto::byte_vector{'a', 'n', 'o', 'n', ' ', 's', 't', 'r', 'e', 'a', 'm', ' ', 'd', 'a', 't', 'a'});
     EXPECT_EQ(server_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
 
-    client.disconnect();
+    client->disconnect();
     server.stop();
 }
 

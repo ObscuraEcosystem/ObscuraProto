@@ -125,10 +125,15 @@ namespace ObscuraProto {
 
     private:
         void allocate(size_t size) {
+            // sodium_malloc does not zero the memory it returns: zero every
+            // fresh allocation so callers cannot observe heap contents through
+            // bytes they have not written (the size ctor, copy/assign and
+            // resize() growth all expose the raw buffer).
             data_ = static_cast<uint8_t*>(sodium_malloc(size));
             if (!data_) {
                 throw std::bad_alloc();
             }
+            sodium_memzero(data_, size);
             size_ = size;
         }
 

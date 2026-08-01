@@ -23,9 +23,9 @@ int main() {
     uint16_t port = 9004;
 
     // ---- Server ----
-    ObscuraProto::net::WsServerWrapper server(server_long_term_key);
+    auto server = std::make_shared<ObscuraProto::net::WsServerWrapper>(server_long_term_key);
 
-    server.register_stream_handler(OP_TEXT_STREAM, [](std::shared_ptr<ObscuraProto::Stream> stream) {
+    server->register_stream_handler(OP_TEXT_STREAM, [](std::shared_ptr<ObscuraProto::Stream> stream) {
         std::cout << "[SERVER] Dedicated handler for OP_TEXT_STREAM (0x6001). Stream #" << stream->get_stream_id()
                   << std::endl;
 
@@ -48,7 +48,7 @@ int main() {
         });
     });
 
-    server.register_stream_handler(OP_BINARY_STREAM, [](std::shared_ptr<ObscuraProto::Stream> stream) {
+    server->register_stream_handler(OP_BINARY_STREAM, [](std::shared_ptr<ObscuraProto::Stream> stream) {
         std::cout << "[SERVER] Dedicated handler for OP_BINARY_STREAM (0x6002). Stream #" << stream->get_stream_id()
                   << std::endl;
 
@@ -62,25 +62,25 @@ int main() {
         });
     });
 
-    server.register_incoming_stream_handler([](std::shared_ptr<ObscuraProto::Stream> stream) {
+    server->register_incoming_stream_handler([](std::shared_ptr<ObscuraProto::Stream> stream) {
         std::cout << "[SERVER] Generic fallback handler for stream #" << stream->get_stream_id()
                   << " (no specific handler registered)" << std::endl;
     });
 
-    server.run(port);
+    server->run(port);
     std::cout << "[SERVER] Started on port " << port << std::endl;
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     // ---- Client ----
-    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
+    auto client = std::make_shared<ObscuraProto::net::WsClientWrapper>(client_view_of_server_key);
 
     std::promise<void> ready_promise;
     std::future<void> ready_future = ready_promise.get_future();
 
-    client.set_on_ready_callback([&]() {
+    client->set_on_ready_callback([&]() {
         std::cout << "[CLIENT] Handshake complete." << std::endl;
 
-        auto text_stream = client.start_stream(OP_TEXT_STREAM);
+        auto text_stream = client->start_stream(OP_TEXT_STREAM);
         std::cout << "[CLIENT] Started TEXT stream #" << text_stream->get_stream_id() << " with opCode 0x" << std::hex
                   << OP_TEXT_STREAM << std::dec << std::endl;
 
@@ -98,7 +98,7 @@ int main() {
         text_stream->write(ObscuraProto::byte_vector{'W', 'o', 'r', 'l', 'd'});
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-        auto binary_stream = client.start_stream(OP_BINARY_STREAM);
+        auto binary_stream = client->start_stream(OP_BINARY_STREAM);
         std::cout << "[CLIENT] Started BINARY stream #" << binary_stream->get_stream_id() << " with opCode 0x"
                   << std::hex << OP_BINARY_STREAM << std::dec << std::endl;
 
@@ -117,20 +117,20 @@ int main() {
         ready_promise.set_value();
     });
 
-    client.connect("ws://localhost:" + std::to_string(port));
+    client->connect("ws://localhost:" + std::to_string(port));
     std::cout << "[CLIENT] Connecting to server..." << std::endl;
 
     if (ready_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
         std::cerr << "[CLIENT] Timed out." << std::endl;
-        server.stop();
+        server->stop();
         return 1;
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     std::cout << "\n[SYSTEM] Shutdown." << std::endl;
-    client.disconnect();
-    server.stop();
+    client->disconnect();
+    server->stop();
 
     return 0;
 }

@@ -24,6 +24,7 @@ server:
     handshake_ms: 10000              # max time to complete handshake (0 = unlimited)
     idle_ms: 300000                  # max idle time before disconnect (0 = unlimited)
     check_interval_ms: 5000          # how often to check for timeouts
+    request_ms: 30000                # default timeout for request-response (0 = unlimited)
 
   # Protocol versions to support, in descending order of preference.
   # The server will negotiate the highest common version with the client.

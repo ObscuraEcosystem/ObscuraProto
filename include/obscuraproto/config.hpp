@@ -46,6 +46,7 @@ namespace ObscuraProto {
         uint32_t handshake_ms = 10000;
         uint32_t idle_ms = 300000;
         uint32_t check_interval_ms = 5000;
+        uint32_t request_ms = 30000;
 
         static TimeoutConfig defaults() {
             return TimeoutConfig{};

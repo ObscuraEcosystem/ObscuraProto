@@ -38,33 +38,33 @@ std::atomic<uint16_t> ServerEdgeIntegrationTest::port_counter{19900};
 TEST_F(ServerEdgeIntegrationTest, StreamEndAndCancel) {
     auto client_identity = ObscuraProto::Crypto::generate_sign_keypair();
 
-    ObscuraProto::net::WsServerWrapper server(server_sign_key);
+    auto server = std::make_shared<ObscuraProto::net::WsServerWrapper>(server_sign_key);
     std::promise<void> server_got_stream;
     std::promise<void> server_got_data;
     std::promise<void> server_got_end;
     std::promise<void> client_got_cancel;
 
-    server.set_client_identity_handler(
+    server->set_client_identity_handler(
         [&](auto hdl, ObscuraProto::PublicKey pk) -> bool { return pk.data == client_identity.publicKey.data; });
-    server.register_stream_handler(OP_ECHO, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
+    server->register_stream_handler(OP_ECHO, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
         server_got_stream.set_value();
         stream->set_data_handler([&](const ObscuraProto::byte_vector& data) { server_got_data.set_value(); });
         stream->set_end_handler([&]() { server_got_end.set_value(); });
     });
-    server.run(port);
+    server->run(port);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    ObscuraProto::net::WsClientWrapper client(client_view_of_server_key);
-    client.set_client_identity(client_identity);
-    client.register_stream_handler(OP_ECHO, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
+    auto client = std::make_shared<ObscuraProto::net::WsClientWrapper>(client_view_of_server_key);
+    client->set_client_identity(client_identity);
+    client->register_stream_handler(OP_ECHO, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
         stream->set_cancel_handler([&]() { client_got_cancel.set_value(); });
     });
     std::promise<void> client_ready;
-    client.set_on_ready_callback([&]() { client_ready.set_value(); });
-    client.connect("ws://localhost:" + std::to_string(port));
+    client->set_on_ready_callback([&]() { client_ready.set_value(); });
+    client->connect("ws://localhost:" + std::to_string(port));
     ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
 
-    auto client_stream = client.start_stream(OP_ECHO);
+    auto client_stream = client->start_stream(OP_ECHO);
     ASSERT_EQ(server_got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
     client_stream->write(ObscuraProto::byte_vector{'d', 'a', 't', 'a'});
     ASSERT_EQ(server_got_data.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
@@ -73,22 +73,22 @@ TEST_F(ServerEdgeIntegrationTest, StreamEndAndCancel) {
 
     std::promise<void> server_ping;
     std::promise<void> client_stream2_ready;
-    client.register_stream_handler(OP_PING, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
+    client->register_stream_handler(OP_PING, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
         stream->set_cancel_handler([&]() { client_got_cancel.set_value(); });
         client_stream2_ready.set_value();
     });
-    server.register_op_handler(OP_PING, [&](auto hdl, ObscuraProto::Payload) {
-        auto srv_stream = server.start_stream(hdl, OP_PING);
+    server->register_op_handler(OP_PING, [&](auto hdl, ObscuraProto::Payload) {
+        auto srv_stream = server->start_stream(hdl, OP_PING);
         srv_stream->cancel();
         server_ping.set_value();
     });
-    client.send(ObscuraProto::PayloadBuilder(OP_PING).build());
+    client->send(ObscuraProto::PayloadBuilder(OP_PING).build());
     ASSERT_EQ(server_ping.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
     ASSERT_EQ(client_stream2_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
     ASSERT_EQ(client_got_cancel.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
 
-    client.disconnect();
-    server.stop();
+    client->disconnect();
+    server->stop();
 }
 
 TEST_F(ServerEdgeIntegrationTest, ServerSyncRequest) {
@@ -381,4 +381,94 @@ TEST_F(ServerEdgeIntegrationTest, AnonDefaultHandler) {
 
     client.disconnect();
     server.stop();
+}
+
+// A2: send() must be safe when called concurrently with on_close (session removal).
+// Either the send succeeds while the session is still present, or it throws
+// LogicError once on_close has removed the session. No deadlock, no crash.
+TEST_F(ServerEdgeIntegrationTest, ConcurrentSendAndClose) {
+    auto client_identity = ObscuraProto::Crypto::generate_sign_keypair();
+    auto server = std::make_shared<ObscuraProto::net::WsServerWrapper>(server_sign_key);
+    std::promise<void> got_hdl;
+    ObscuraProto::net::WsConnectionHdl client_hdl;
+    server->set_client_identity_handler(
+        [&](auto hdl, ObscuraProto::PublicKey pk) -> bool { return pk.data == client_identity.publicKey.data; });
+    server->register_op_handler(OP_PING, [&](auto hdl, ObscuraProto::Payload) {
+        client_hdl = hdl;
+        got_hdl.set_value();
+    });
+    server->run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    auto client = std::make_shared<ObscuraProto::net::WsClientWrapper>(client_view_of_server_key);
+    client->set_client_identity(client_identity);
+    std::promise<void> client_ready;
+    client->set_on_ready_callback([&]() { client_ready.set_value(); });
+    client->connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    client->send(ObscuraProto::PayloadBuilder(OP_PING).build());
+    ASSERT_EQ(got_hdl.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    std::atomic<bool> stop_sending{false};
+    std::atomic<int> send_attempts{0};
+    std::thread sender([&]() {
+        while (!stop_sending.load(std::memory_order_relaxed)) {
+            try {
+                server->send(client_hdl, ObscuraProto::PayloadBuilder(OP_ECHO).build());
+            } catch (const ObscuraProto::LogicError&) {
+                // Session already removed by on_close: acceptable.
+            } catch (...) {
+                // Any other failure is a test failure signal.
+                ADD_FAILURE() << "Unexpected exception from concurrent send()";
+            }
+            ++send_attempts;
+        }
+    });
+
+    // Let the sender hammer for a while before the close is triggered, then stop()
+    // fires on_close concurrently with the send() calls.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    server->stop();  // triggers on_close concurrently with the send() calls
+    stop_sending.store(true, std::memory_order_relaxed);
+    sender.join();
+
+    EXPECT_GT(send_attempts.load(), 0);
+    client->disconnect();
+}
+
+// A3: destroying the server while a server-side stream is still alive must not
+// crash or throw when the stream is used afterwards: the send_fn captures a
+// weak_ptr to the owner, so write/end/cancel silently drop once it is expired.
+TEST_F(ServerEdgeIntegrationTest, StreamWriteAfterServerDestroyedIsSafe) {
+    std::shared_ptr<ObscuraProto::Stream> server_stream;
+    std::promise<void> got_stream;
+    auto server = std::make_shared<ObscuraProto::net::WsServerWrapper>(server_sign_key);
+    server->register_anon_stream_handler(OP_ECHO, [&](std::shared_ptr<ObscuraProto::Stream> stream) {
+        server_stream = stream;
+        got_stream.set_value();
+    });
+    server->run(port);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    auto client = std::make_shared<ObscuraProto::net::WsClientWrapper>(client_view_of_server_key);
+    std::promise<void> client_ready;
+    client->set_on_ready_callback([&]() { client_ready.set_value(); });
+    client->connect("ws://localhost:" + std::to_string(port));
+    ASSERT_EQ(client_ready.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+
+    auto client_stream = client->start_stream(OP_ECHO);
+    ASSERT_EQ(got_stream.get_future().wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    ASSERT_NE(server_stream, nullptr);
+
+    // Destroy the server while the server-side stream object is still alive.
+    server->stop();
+    server.reset();
+
+    // Owner is expired: all of these must be silent no-ops.
+    EXPECT_NO_THROW(server_stream->write(ObscuraProto::byte_vector{'x'}));
+    EXPECT_NO_THROW(server_stream->end());
+    EXPECT_NO_THROW(server_stream->cancel());
+
+    client->disconnect();
 }
