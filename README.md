@@ -167,6 +167,8 @@ ObscuraProto::KeyPair client_view_of_server_key;
 client_view_of_server_key.publicKey = server_long_term_key.publicKey; // This key must be distributed to the client securely
 ```
 
+Since v1.1.1 the library also provides deterministic key derivation: `Crypto::keypair_from_seed(seed, len)` builds an Ed25519 key pair from a strictly 32-byte seed, and `Crypto::derive_public_key(private_key, len)` derives the Ed25519 public key from a strictly 64-byte private key. See the [API reference](docs/api_reference.md) for details.
+
 ### Step 3: Session Creation
 
 Create `Session` objects for both the client and the server.
@@ -263,22 +265,38 @@ This pattern uses a special internal operation code (`0xFFFF`) for responses and
 
 #### Initiating a Request
 
-Both `WsClientWrapper` and `WsServerWrapper` have an `async_request` method. It sends a request and returns a `std::future` that will be fulfilled with the response. There is also a `sync_request` method available for synchronous request-response interactions.
+Both `WsClientWrapper` and `WsServerWrapper` have an `async_request` method. It sends a request and returns a `std::future` that will be fulfilled with the response. There is also a `sync_request` method available for synchronous request-response interactions. Since v1.1.0 both methods accept an optional `timeout_ms` parameter (see [Request Timeouts](#611-request-timeouts) below).
 
 ```cpp
 // Client-side example
 std::future<ObscuraProto::Payload> response_future = client.async_request(request_payload);
 
+// Per-request timeout in milliseconds (0 = use the config default)
+std::future<ObscuraProto::Payload> response_future = client.async_request(request_payload, 5000);
+
 // Server-side example (requires a connection handle `hdl`)
 std::future<ObscuraProto::Payload> response_future = server.async_request(hdl, request_payload);
 
 // Common logic to get the response
-if (response_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready) {
+try {
     ObscuraProto::Payload response = response_future.get();
     // Process the application-level response payload.
     // The 0xFFFF wrapper is automatically handled by the library.
+} catch (const ObscuraProto::TimeoutError& e) {
+    // The response did not arrive within the timeout budget.
 }
 ```
+
+##### 6.1.1. Request Timeouts
+
+Since v1.1.0 every request can be bounded by a timeout:
+
+- `async_request(payload, timeout_ms)` / `sync_request(payload, timeout_ms)` on the client; `async_request(hdl, payload, timeout_ms)` / `sync_request(hdl, payload, timeout_ms)` on the server. The old signatures remain and are fully backward compatible.
+- `timeout_ms = 0` means "use the default": `config_.timeouts.request_ms` (30000 ms by default).
+- An unlimited request is configured in the config: `request_ms: 0` or `timeouts.enabled: false`.
+- `sync_request` waits via `wait_for` and throws `ObscuraProto::TimeoutError` when the timeout expires — it no longer blocks forever.
+- For `async_request`, the server's periodic `check_timeouts()` and the client's watchdog complete expired promises with `set_exception(TimeoutError)`; `std::future::get()` rethrows it. The timeout-vs-late-response race is safe: both bookkeeping maps live under a single mutex, so a promise is never completed twice.
+- If `send()` fails inside `async_request`, the pending-request state is cleaned up and the future is completed with an exception instead of being left dangling.
 
 #### Handling a Request and Sending a Response (Recommended)
 
@@ -525,6 +543,9 @@ A stream is managed by a unique `stream_id` and a set of special operation codes
 The payload for a `STREAM_DATA` message looks like this before encryption:
 `[OpCode (2)] + [stream_id (4)] + [data_chunk (N)]`
 
+#### Exception Contract
+
+`Stream::write`, `Stream::end` and `Stream::cancel` are `noexcept` — they never throw. The internal send callback captures a `std::weak_ptr` to the owning wrapper: once the owner is destroyed the callback is a silent no-op, and transport-level send failures are logged and swallowed by the wrapper. Data written to a dead stream is dropped.
 
 ### 8.3. Streaming API Usage Example
 
@@ -644,6 +665,7 @@ See `config.yml` in the project root for the full reference with comments.
 |                      | `handshake_ms`              | `10000`    | Handshake timeout (ms)                     |
 |                      | `idle_ms`                   | `300000`   | Idle connection timeout (ms)               |
 |                      | `check_interval_ms`         | `5000`     | Timeout check interval (ms)                |
+|                      | `request_ms`                | `30000`    | Default request timeout (ms; `0` = unlimited) |
 | `opcodes`            | `RESPONSE`                  | `0xFFFF`   | Reserved: response opcode                  |
 |                      | `STREAM_START`              | `0xFFFD`   | Reserved: stream start opcode              |
 |                      | `STREAM_DATA`               | `0xFFFC`   | Reserved: stream data opcode               |

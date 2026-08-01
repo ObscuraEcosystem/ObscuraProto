@@ -34,6 +34,12 @@ An exception thrown when incorrect arguments are passed to a function. Inherits 
 
 ---
 
+### `class ObscuraProto::TimeoutError`
+An exception thrown when a request exceeds its timeout budget. Inherits from `RuntimeError`.
+- **Raised by:** `sync_request()` (via `wait_for`) when the timeout expires before the response arrives; delivered to `async_request()` futures whose deadline passed — `std::future::get()` rethrows it.
+
+---
+
 ## `keys.hpp`
 
 Defines basic structures for storing cryptographic keys and signatures.
@@ -145,6 +151,20 @@ Generates a key pair (X25519) for key exchange using the Diffie-Hellman (ECDH) a
 ### `static KeyPair generate_sign_keypair()`
 Generates a key pair (Ed25519) for creating and verifying digital signatures.
 
+### `static KeyPair keypair_from_seed(const uint8_t* seed, size_t len)`
+Deterministically derives an Ed25519 key pair from a 32-byte seed (`crypto_sign_seed_keypair`).
+- `seed`: The 32-byte seed (`crypto_sign_SEEDBYTES`).
+- `len`: The seed length in bytes (must be exactly 32).
+- **Returns:** A `KeyPair` object.
+- **Throws:** `InvalidArgument` if `len` is not exactly 32; `RuntimeError` if seed expansion fails.
+
+### `static PublicKey derive_public_key(const uint8_t* private_key, size_t len)`
+Derives the Ed25519 public key from a 64-byte private key (`crypto_sign_ed25519_sk_to_pk`).
+- `private_key`: The 64-byte private key (`seed || public`).
+- `len`: The private key length in bytes (must be exactly 64).
+- **Returns:** A `PublicKey` object.
+- **Throws:** `InvalidArgument` if `len` is not exactly 64.
+
 ### `static Signature sign(const byte_vector& message, const PrivateKey& private_key)`
 Creates a digital signature for a message.
 - **Throws:** `InvalidArgument` if the private key size is incorrect.
@@ -252,11 +272,26 @@ Sends a response to a client for a previously received request. The `payload` pr
 - `payload`: The application-level `Payload` containing the actual response data.
 
 #### `std::future<Payload> async_request(WsConnectionHdl hdl, const Payload& payload)`
-Sends a `Payload` as a request to a specific client and returns a `std::future` that will be fulfilled with the client's response.
+Sends a `Payload` as a request to a specific client and returns a `std::future` that will be fulfilled with the client's response. The default timeout from `config_.timeouts.request_ms` (30000 ms) applies; a `0` value in the config means unlimited, and `timeouts.enabled: false` disables the timeout enforcement.
 - `hdl`: The connection handle of the client to send the request to.
 - `payload`: The application-level `Payload` to send as a request.
-- **Returns:** A `std::future<Payload>` that will eventually hold the client's application-level response.
+- **Returns:** A `std::future<Payload>` that will eventually hold the client's application-level response. On timeout the future resolves with `ObscuraProto::TimeoutError` (`get()` rethrows it).
 - **Throws:** `LogicError` if the session is not ready.
+
+#### `std::future<Payload> async_request(WsConnectionHdl hdl, const Payload& payload, uint32_t timeout_ms)`
+Same as `async_request(hdl, payload)` but with an explicit per-request timeout.
+- `timeout_ms`: Maximum time to wait for the response in milliseconds. `0` = use the default from `config_.timeouts.request_ms`; unlimited = `request_ms: 0` in the config or `timeouts.enabled: false`.
+- **Returns:** A `std::future<Payload>` that will eventually hold the client's application-level response. On timeout the future resolves with `ObscuraProto::TimeoutError`.
+- **Throws:** `LogicError` if the session is not ready.
+
+#### `Payload sync_request(WsConnectionHdl hdl, const Payload& payload)`
+Sends a synchronous request to a specific client and blocks until the response arrives.
+- **Throws:** `LogicError` if the session is not ready; `ObscuraProto::TimeoutError` if the default timeout (`config_.timeouts.request_ms`, 30000 ms) expires before the response arrives. A `0` value in the config means unlimited, `timeouts.enabled: false` disables timeout enforcement.
+
+#### `Payload sync_request(WsConnectionHdl hdl, const Payload& payload, uint32_t timeout_ms)`
+Sends a synchronous request with an explicit per-request timeout and blocks until the response arrives.
+- `timeout_ms`: Maximum time to wait for the response in milliseconds. `0` = use the default from `config_.timeouts.request_ms`; unlimited = `request_ms: 0` in the config or `timeouts.enabled: false`.
+- **Throws:** `LogicError` if the session is not ready; `ObscuraProto::TimeoutError` if the timeout expires before the response arrives.
 
 #### `void register_op_handler(Payload::OpCode op_code, OnPayloadCallback callback)`
 Registers a handler for a specific operation code. When a payload with a matching `op_code` is received, this specific callback will be invoked.
@@ -320,12 +355,12 @@ Sends an encrypted `Payload` to a specific client identified by their Ed25519 pu
 - **Throws:** `LogicError` if the identity is not currently connected.
 
 #### `std::future<Payload> async_request_to_identity(const PublicKey& identity_pk, const Payload& payload)`
-Sends a request to a specific client identified by their Ed25519 public key and returns a `std::future` for the response.
+Sends a request to a specific client identified by their Ed25519 public key and returns a `std::future` for the response. The default timeout from `config_.timeouts.request_ms` applies; on timeout the future resolves with `ObscuraProto::TimeoutError`.
 - **Throws:** `LogicError` if the identity is not connected.
 
 #### `Payload sync_request_to_identity(const PublicKey& identity_pk, const Payload& payload)`
 Sends a synchronous request to a specific client identified by their Ed25519 public key and waits for the response.
-- **Throws:** `LogicError` if the identity is not connected.
+- **Throws:** `LogicError` if the identity is not connected; `ObscuraProto::TimeoutError` if the default timeout (`config_.timeouts.request_ms`) expires before the response arrives.
 
 ---
 
@@ -350,10 +385,25 @@ Disconnects from the server.
 Encrypts and sends a `Payload` to the server.
 
 #### `std::future<Payload> async_request(const Payload& payload)`
-Sends a `Payload` as a request to the server and returns a `std::future` that will be fulfilled with the server's response.
+Sends a `Payload` as a request to the server and returns a `std::future` that will be fulfilled with the server's response. The default timeout from `config_.timeouts.request_ms` (30000 ms) applies; a `0` value in the config means unlimited, and `timeouts.enabled: false` disables the timeout enforcement.
 - `payload`: The application-level `Payload` to send as a request.
-- **Returns:** A `std::future<Payload>` that will eventually hold the server's application-level response.
+- **Returns:** A `std::future<Payload>` that will eventually hold the server's application-level response. On timeout the future resolves with `ObscuraProto::TimeoutError` (`get()` rethrows it).
 - **Throws:** `LogicError` if the session is not ready.
+
+#### `std::future<Payload> async_request(const Payload& payload, uint32_t timeout_ms)`
+Same as `async_request(payload)` but with an explicit per-request timeout.
+- `timeout_ms`: Maximum time to wait for the response in milliseconds. `0` = use the default from `config_.timeouts.request_ms`; unlimited = `request_ms: 0` in the config or `timeouts.enabled: false`.
+- **Returns:** A `std::future<Payload>` that will eventually hold the server's application-level response. On timeout the future resolves with `ObscuraProto::TimeoutError`.
+- **Throws:** `LogicError` if the session is not ready.
+
+#### `Payload sync_request(const Payload& payload)`
+Sends a synchronous request to the server and blocks until the response arrives.
+- **Throws:** `LogicError` if the session is not ready; `ObscuraProto::TimeoutError` if the default timeout (`config_.timeouts.request_ms`, 30000 ms) expires before the response arrives. A `0` value in the config means unlimited, `timeouts.enabled: false` disables timeout enforcement.
+
+#### `Payload sync_request(const Payload& payload, uint32_t timeout_ms)`
+Sends a synchronous request with an explicit per-request timeout and blocks until the response arrives.
+- `timeout_ms`: Maximum time to wait for the response in milliseconds. `0` = use the default from `config_.timeouts.request_ms`; unlimited = `request_ms: 0` in the config or `timeouts.enabled: false`.
+- **Throws:** `LogicError` if the session is not ready; `ObscuraProto::TimeoutError` if the timeout expires before the response arrives.
 
 #### `void send_response(uint32_t request_id, const Payload& payload)`
 Sends a response to the server for a previously received request.
@@ -456,6 +506,38 @@ Checks if the connected peer provided and successfully verified an Ed25519 ident
 #### `std::optional<PublicKey> get_peer_identity() const`
 Returns the verified Ed25519 public key of the connected peer.
 - **Returns:** The peer's public key, or `std::nullopt` if no identity was provided.
+
+---
+
+## `stream.hpp`
+
+A bidirectional data stream over an established secure channel. Streams are created by `start_stream` (outgoing) or delivered to an `incoming_stream_handler` (incoming). Inherits from `std::enable_shared_from_this`.
+
+### `class ObscuraProto::Stream`
+
+#### `uint32_t get_stream_id() const`
+Returns the unique stream identifier.
+
+#### `std::optional<Payload::OpCode> get_op_code() const`
+Returns the application-level opCode the stream was opened with (V1_1), or `std::nullopt` for legacy streams.
+
+#### `void write(const byte_vector& data) noexcept`
+Sends a data chunk over the stream. Never throws: if the owning wrapper is destroyed, the data is silently dropped (the internal send callback captures a `std::weak_ptr` to the owner); transport-level send failures are logged and swallowed.
+
+#### `void end() noexcept`
+Signals the end of the stream. Never throws; a dead stream is a silent no-op.
+
+#### `void cancel() noexcept`
+Immediately terminates the stream from either side. Never throws; a dead stream is a silent no-op.
+
+#### `void set_data_handler(DataHandler handler)`
+Sets a callback invoked for each incoming data chunk. Signature: `std::function<void(byte_vector)>`.
+
+#### `void set_end_handler(EndHandler handler)`
+Sets a callback invoked when the peer ends the stream. Signature: `std::function<void()>`.
+
+#### `void set_cancel_handler(CancelHandler handler)`
+Sets a callback invoked when the stream is cancelled. Signature: `std::function<void()>`.
 
 ---
 

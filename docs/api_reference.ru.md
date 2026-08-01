@@ -34,6 +34,12 @@
 
 ---
 
+### `class ObscuraProto::TimeoutError`
+Исключение, выбрасываемое, когда запрос превышает свой таймаут. Наследуется от `RuntimeError`.
+- **Выбрасывается:** методом `sync_request()` (через `wait_for`), когда таймаут истек до прихода ответа; доставляется future'ам от `async_request()`, чей дедлайн прошел — `std::future::get()` пробрасывает его.
+
+---
+
 ## `keys.hpp`
 
 Определяет базовые структуры для хранения криптографических ключей и подписей.
@@ -145,6 +151,20 @@
 ### `static KeyPair generate_sign_keypair()`
 Генерирует пару ключей (Ed25519) для создания и проверки цифровых подписей.
 
+### `static KeyPair keypair_from_seed(const uint8_t* seed, size_t len)`
+Детерминированно выводит пару ключей Ed25519 из 32-байтного seed (`crypto_sign_seed_keypair`).
+- `seed`: 32-байтный seed (`crypto_sign_SEEDBYTES`).
+- `len`: Длина seed в байтах (должна быть строго равна 32).
+- **Возвращает:** Объект `KeyPair`.
+- **Выбрасывает:** `InvalidArgument`, если `len` не равен 32; `RuntimeError` при сбое разворачивания seed.
+
+### `static PublicKey derive_public_key(const uint8_t* private_key, size_t len)`
+Выводит публичный ключ Ed25519 из 64-байтного приватного ключа (`crypto_sign_ed25519_sk_to_pk`).
+- `private_key`: 64-байтный приватный ключ (`seed || public`).
+- `len`: Длина приватного ключа в байтах (должна быть строго равна 64).
+- **Возвращает:** Объект `PublicKey`.
+- **Выбрасывает:** `InvalidArgument`, если `len` не равен 64.
+
 ### `static Signature sign(const byte_vector& message, const PrivateKey& private_key)`
 Создает цифровую подпись для сообщения.
 - **Выбрасывает:** `InvalidArgument`, если размер приватного ключа некорректен.
@@ -252,11 +272,26 @@
 - `payload`: `Payload` на уровне приложения, содержащий фактические данные ответа.
 
 #### `std::future<Payload> async_request(WsConnectionHdl hdl, const Payload& payload)`
-Отправляет `Payload` в качестве запроса определенному клиенту и возвращает `std::future`, который будет выполнен с ответом клиента.
+Отправляет `Payload` в качестве запроса определенному клиенту и возвращает `std::future`, который будет выполнен с ответом клиента. Применяется таймаут по умолчанию из `config_.timeouts.request_ms` (30000 мс); значение `0` в конфиге означает безлимит, а `timeouts.enabled: false` отключает контроль таймаутов.
 - `hdl`: Дескриптор соединения клиента, которому отправляется запрос.
 - `payload`: `Payload` на уровне приложения для отправки в качестве запроса.
-- **Возвращает:** `std::future<Payload>`, который в конечном итоге будет содержать ответ клиента на уровне приложения.
+- **Возвращает:** `std::future<Payload>`, который в конечном итоге будет содержать ответ клиента на уровне приложения. По таймауту future резолвится с `ObscuraProto::TimeoutError` (`get()` пробрасывает его).
 - **Выбрасывает:** `LogicError`, если сессия не готова.
+
+#### `std::future<Payload> async_request(WsConnectionHdl hdl, const Payload& payload, uint32_t timeout_ms)`
+То же, что `async_request(hdl, payload)`, но с явным таймаутом на запрос.
+- `timeout_ms`: Максимальное время ожидания ответа в миллисекундах. `0` = использовать значение по умолчанию из `config_.timeouts.request_ms`; безлимит = `request_ms: 0` в конфиге или `timeouts.enabled: false`.
+- **Возвращает:** `std::future<Payload>`, который в конечном итоге будет содержать ответ клиента на уровне приложения. По таймауту future резолвится с `ObscuraProto::TimeoutError`.
+- **Выбрасывает:** `LogicError`, если сессия не готова.
+
+#### `Payload sync_request(WsConnectionHdl hdl, const Payload& payload)`
+Отправляет синхронный запрос определенному клиенту и блокируется до прихода ответа.
+- **Выбрасывает:** `LogicError`, если сессия не готова; `ObscuraProto::TimeoutError`, если таймаут по умолчанию (`config_.timeouts.request_ms`, 30000 мс) истек до прихода ответа. Значение `0` в конфиге означает безлимит, `timeouts.enabled: false` отключает контроль таймаутов.
+
+#### `Payload sync_request(WsConnectionHdl hdl, const Payload& payload, uint32_t timeout_ms)`
+Отправляет синхронный запрос с явным таймаутом на запрос и блокируется до прихода ответа.
+- `timeout_ms`: Максимальное время ожидания ответа в миллисекундах. `0` = использовать значение по умолчанию из `config_.timeouts.request_ms`; безлимит = `request_ms: 0` в конфиге или `timeouts.enabled: false`.
+- **Выбрасывает:** `LogicError`, если сессия не готова; `ObscuraProto::TimeoutError`, если таймаут истек до прихода ответа.
 
 #### `void register_op_handler(Payload::OpCode op_code, OnPayloadCallback callback)`
 Регистрирует обработчик для конкретного кода операции. Когда будет получена полезная нагрузка с соответствующим `op_code`, будет вызван этот колбэк.
@@ -319,12 +354,12 @@
 - **Выбрасывает:** `LogicError`, если идентификация в данный момент не подключена.
 
 #### `std::future<Payload> async_request_to_identity(const PublicKey& identity_pk, const Payload& payload)`
-Отправляет запрос конкретному клиенту по его публичному ключу Ed25519 и возвращает `std::future` для ответа.
+Отправляет запрос конкретному клиенту по его публичному ключу Ed25519 и возвращает `std::future` для ответа. Применяется таймаут по умолчанию из `config_.timeouts.request_ms`; по таймауту future резолвится с `ObscuraProto::TimeoutError`.
 - **Выбрасывает:** `LogicError`, если идентификация не подключена.
 
 #### `Payload sync_request_to_identity(const PublicKey& identity_pk, const Payload& payload)`
 Отправляет синхронный запрос конкретному клиенту по его публичному ключу Ed25519 и ожидает ответа.
-- **Выбрасывает:** `LogicError`, если идентификация не подключена.
+- **Выбрасывает:** `LogicError`, если идентификация не подключена; `ObscuraProto::TimeoutError`, если таймаут по умолчанию (`config_.timeouts.request_ms`) истек до прихода ответа.
 
 ---
 
@@ -349,10 +384,25 @@
 Шифрует и отправляет `Payload` на сервер.
 
 #### `std::future<Payload> async_request(const Payload& payload)`
-Отправляет `Payload` в качестве запроса на сервер и возвращает `std::future`, который будет выполнен с ответом сервера.
+Отправляет `Payload` в качестве запроса на сервер и возвращает `std::future`, который будет выполнен с ответом сервера. Применяется таймаут по умолчанию из `config_.timeouts.request_ms` (30000 мс); значение `0` в конфиге означает безлимит, а `timeouts.enabled: false` отключает контроль таймаутов.
 - `payload`: `Payload` на уровне приложения для отправки в качестве запроса.
-- **Возвращает:** `std::future<Payload>`, который в конечном итоге будет содержать ответ сервера на уровне приложения.
+- **Возвращает:** `std::future<Payload>`, который в конечном итоге будет содержать ответ сервера на уровне приложения. По таймауту future резолвится с `ObscuraProto::TimeoutError` (`get()` пробрасывает его).
 - **Выбрасывает:** `LogicError`, если сессия не готова.
+
+#### `std::future<Payload> async_request(const Payload& payload, uint32_t timeout_ms)`
+То же, что `async_request(payload)`, но с явным таймаутом на запрос.
+- `timeout_ms`: Максимальное время ожидания ответа в миллисекундах. `0` = использовать значение по умолчанию из `config_.timeouts.request_ms`; безлимит = `request_ms: 0` в конфиге или `timeouts.enabled: false`.
+- **Возвращает:** `std::future<Payload>`, который в конечном итоге будет содержать ответ сервера на уровне приложения. По таймауту future резолвится с `ObscuraProto::TimeoutError`.
+- **Выбрасывает:** `LogicError`, если сессия не готова.
+
+#### `Payload sync_request(const Payload& payload)`
+Отправляет синхронный запрос на сервер и блокируется до прихода ответа.
+- **Выбрасывает:** `LogicError`, если сессия не готова; `ObscuraProto::TimeoutError`, если таймаут по умолчанию (`config_.timeouts.request_ms`, 30000 мс) истек до прихода ответа. Значение `0` в конфиге означает безлимит, `timeouts.enabled: false` отключает контроль таймаутов.
+
+#### `Payload sync_request(const Payload& payload, uint32_t timeout_ms)`
+Отправляет синхронный запрос с явным таймаутом на запрос и блокируется до прихода ответа.
+- `timeout_ms`: Максимальное время ожидания ответа в миллисекундах. `0` = использовать значение по умолчанию из `config_.timeouts.request_ms`; безлимит = `request_ms: 0` в конфиге или `timeouts.enabled: false`.
+- **Выбрасывает:** `LogicError`, если сессия не готова; `ObscuraProto::TimeoutError`, если таймаут истек до прихода ответа.
 
 #### `void send_response(uint32_t request_id, const Payload& payload)`
 Отправляет ответ на сервер для ранее полученного запроса.
@@ -455,6 +505,38 @@
 #### `std::optional<PublicKey> get_peer_identity() const`
 Возвращает проверенный публичный ключ Ed25519 подключенного клиента.
 - **Возвращает:** Публичный ключ клиента или `std::nullopt`, если идентификация не была предоставлена.
+
+---
+
+## `stream.hpp`
+
+Двунаправленный поток данных по установленному защищенному каналу. Потоки создаются через `start_stream` (исходящие) или доставляются в `incoming_stream_handler` (входящие). Наследуется от `std::enable_shared_from_this`.
+
+### `class ObscuraProto::Stream`
+
+#### `uint32_t get_stream_id() const`
+Возвращает уникальный идентификатор потока.
+
+#### `std::optional<Payload::OpCode> get_op_code() const`
+Возвращает код операции приложения, с которым был открыт поток (V1_1), или `std::nullopt` для потоков в легаси-формате.
+
+#### `void write(const byte_vector& data) noexcept`
+Отправляет чанк данных по потоку. Никогда не бросает исключений: если владеющая обертка уничтожена, данные тихо отбрасываются (внутренний колбэк отправки захватывает `std::weak_ptr` на владельца); ошибки отправки на транспортном уровне логируются и проглатываются.
+
+#### `void end() noexcept`
+Сигнализирует об окончании потока. Никогда не бросает исключений; «мертвый» поток — тихая пустышка.
+
+#### `void cancel() noexcept`
+Немедленно завершает поток с любой стороны. Никогда не бросает исключений; «мертвый» поток — тихая пустышка.
+
+#### `void set_data_handler(DataHandler handler)`
+Устанавливает колбэк, вызываемый для каждого входящего чанка данных. Сигнатура: `std::function<void(byte_vector)>`.
+
+#### `void set_end_handler(EndHandler handler)`
+Устанавливает колбэк, вызываемый, когда сторона-пир завершает поток. Сигнатура: `std::function<void()>`.
+
+#### `void set_cancel_handler(CancelHandler handler)`
+Устанавливает колбэк, вызываемый при отмене потока. Сигнатура: `std::function<void()>`.
 
 ---
 

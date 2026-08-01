@@ -167,6 +167,8 @@ ObscuraProto::KeyPair client_view_of_server_key;
 client_view_of_server_key.publicKey = server_long_term_key.publicKey; // Этот ключ должен быть безопасно доставлен клиенту
 ```
 
+Начиная с v1.1.1 библиотека также предоставляет детерминированную деривацию ключей: `Crypto::keypair_from_seed(seed, len)` строит пару ключей Ed25519 из строго 32-байтного seed, а `Crypto::derive_public_key(private_key, len)` выводит публичный ключ Ed25519 из строго 64-байтного приватного ключа. Подробности см. в [справочнике API](docs/api_reference.ru.md).
+
 ### Шаг 3: Создание сессий
 
 Создайте объекты `Session` как для клиента, так и для сервера.
@@ -263,22 +265,38 @@ ObscuraProto::Session client_session(ObscuraProto::Role::CLIENT, client_view_of_
 
 #### Инициация запроса
 
-И `WsClientWrapper`, и `WsServerWrapper` имеют метод `async_request`. Он отправляет запрос и возвращает `std::future`, который будет выполнен с ответом. Также доступен метод `sync_request` для синхронных взаимодействий запрос-ответ.
+И `WsClientWrapper`, и `WsServerWrapper` имеют метод `async_request`. Он отправляет запрос и возвращает `std::future`, который будет выполнен с ответом. Также доступен метод `sync_request` для синхронных взаимодействий запрос-ответ. Начиная с v1.1.0 оба метода принимают необязательный параметр `timeout_ms` (см. [Таймауты запросов](#611-таймауты-запросов) ниже).
 
 ```cpp
 // Пример на стороне клиента
 std::future<ObscuraProto::Payload> response_future = client.async_request(request_payload);
 
+// Таймаут запроса в миллисекундах (0 = использовать значение по умолчанию из конфига)
+std::future<ObscuraProto::Payload> response_future = client.async_request(request_payload, 5000);
+
 // Пример на стороне сервера (требует дескриптор соединения `hdl`)
 std::future<ObscuraProto::Payload> response_future = server.async_request(hdl, request_payload);
 
 // Общая логика для получения ответа
-if (response_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready) {
+try {
     ObscuraProto::Payload response = response_future.get();
     // Обрабатываем полезную нагрузку ответа на уровне приложения.
     // Обертка 0xFFFF автоматически обрабатывается библиотекой.
+} catch (const ObscuraProto::TimeoutError& e) {
+    // Ответ не пришел в пределах таймаута.
 }
 ```
+
+##### 6.1.1. Таймауты запросов
+
+Начиная с v1.1.0 каждый запрос может быть ограничен таймаутом:
+
+- `async_request(payload, timeout_ms)` / `sync_request(payload, timeout_ms)` на клиенте; `async_request(hdl, payload, timeout_ms)` / `sync_request(hdl, payload, timeout_ms)` на сервере. Старые сигнатуры остаются и полностью обратно совместимы.
+- `timeout_ms = 0` означает «использовать значение по умолчанию»: `config_.timeouts.request_ms` (по умолчанию 30000 мс).
+- Безлимитный запрос настраивается в конфиге: `request_ms: 0` или `timeouts.enabled: false`.
+- `sync_request` ожидает через `wait_for` и бросает `ObscuraProto::TimeoutError` по истечении таймаута — вечной блокировки больше нет.
+- Для `async_request` периодический `check_timeouts()` на сервере и watchdog на клиенте завершают просроченные промисы через `set_exception(TimeoutError)`; `std::future::get()` пробрасывает исключение. Гонка «таймаут vs поздний ответ» безопасна: обе служебные карты лежат под одним мьютексом, поэтому промис не может быть завершен дважды.
+- Если `send()` в `async_request` завершился с ошибкой, состояние ожидающего запроса очищается, а future завершается исключением, а не остается «висеть».
 
 #### Обработка запроса и отправка ответа (рекомендуемый способ)
 
@@ -525,6 +543,10 @@ auto response = server.sync_request_to_identity(client_pk, request);
 Полезная нагрузка для сообщения `STREAM_DATA` до шифрования выглядит так:
 `[Код операции (2)] + [stream_id (4)] + [часть_данных (N)]`
 
+#### Контракт исключений
+
+`Stream::write`, `Stream::end` и `Stream::cancel` объявлены `noexcept` — они никогда не бросают исключения. Внутренний колбэк отправки захватывает `std::weak_ptr` на владеющую обертку: после уничтожения владельца колбэк становится тихой пустышкой, а ошибки отправки на транспортном уровне логируются и проглатываются оберткой. Данные, записанные в «мертвый» поток, отбрасываются.
+
 ### 8.3. Пример использования API для стриминга
 
 API спроектирован вокруг двух основных концепций: `register_incoming_stream_handler` для получения новых потоков и `start_stream` для их инициации.
@@ -641,6 +663,7 @@ ObscuraProto::net::WsServerWrapper server(server_key, cfg);
 |                     | `handshake_ms`               | `10000`   | Таймаут хендшейка (мс)                      |
 |                     | `idle_ms`                    | `300000`  | Таймаут бездействия (мс)                    |
 |                     | `check_interval_ms`          | `5000`    | Интервал проверки таймаутов (мс)            |
+|                     | `request_ms`                 | `30000`   | Таймаут запроса по умолчанию (мс; `0`=без лимита) |
 | `opcodes`           | `RESPONSE`                   | `0xFFFF`  | Зарезервированный: opcode ответа            |
 |                     | `STREAM_START`               | `0xFFFD`  | Зарезервированный: старт стрима            |
 |                     | `STREAM_DATA`                | `0xFFFC`  | Зарезервированный: данные стрима           |
